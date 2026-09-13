@@ -1,0 +1,1388 @@
+# ============================================================
+# ADO Roadmap Sync Script v6
+# Pulls Product Backlog Items + orphan Features/Epics
+# from HMIS (TFS on-prem) and generates a roadmap Excel
+# matching the original format, with a Dashboard sheet.
+#
+# New in v6: no carry-over — the roadmap is built completely
+# fresh from TFS on every run.
+#
+# New in v5: TFS fields Ticketnumber / BusinessImpactValue /
+# BusinessValueCategory / Impactlevel are pulled from work
+# items. Feature-level values inherit down to every child
+# story; story-level values override the feature's values.
+#
+# Run: python ado_roadmap_sync.py
+# Output: roadmap_<YYYY-MM-DD_HH-MM>.xlsx in the same folder
+#
+# At startup the script asks for the two cutoff dates (ENTER keeps
+# the configured defaults). Pass --defaults to skip the wizard.
+# ============================================================
+
+import requests
+import base64
+import re
+import os
+import sys
+from datetime import datetime
+from collections import defaultdict
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo, TableColumn
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+TFS_URL = "http://ahq-tfs-azure/DefaultCollection"
+PAT = "gym5zjd2luca3exar5mc2izkjsu7hudv4bxbaxz6bixundvpskjq"
+OUTPUT_FOLDER = os.path.dirname(os.path.abspath(__file__))
+API_VERSION = "5.1"
+
+PROJECT = "HMIS"
+
+# All projects to query
+PROJECTS = ["HMIS", "HR System", "Mobile Applications", "Websites"]
+
+PBI_TYPES = ["Product Backlog Item", "Product Non Backlog Item"]
+FEATURE_TYPES = ["Feature", "Epic"]
+
+ALLOWED_OWNERS = [
+    "ahmed nasr younis abdelwahed",
+    "mohamed sharshira",
+    "mohamed ahmed mohamed aly",
+    "ibrahim abdelfattah mohamed ghanem",
+    "nada adel khamis",
+    "mohamed adel khalifa",
+    "mohamed moataz",
+    "elzohery",
+]
+
+# New TFS fields (roadmap columns). Values live on Features and stories;
+# a Feature's value applies to every child story, unless the story has
+# its own value for that field (story level overrides feature level).
+NEW_FIELD_REFS = {
+    "Ticket Number": "Custom.Ticketnumber",
+    "Business Value": "Custom.BusinessImpactValue",
+    "Category": "Custom.BusinessValueCategory",
+    "Impact": "Custom.Impactlevel",
+}
+# Some of these fields are HTML-formatted in TFS and need cleaning
+HTML_NEW_FIELDS = {"Custom.Ticketnumber", "Custom.BusinessImpactValue"}
+
+# Cutoff date for dashboard "new items" counting
+CUTOFF_DATE = "2026-09-01"
+
+# Roadmap cutoff date — stories with a Done/Delivery date BEFORE this are excluded.
+# Stories not done yet, or done on/after this date, are included.
+ROADMAP_CUTOFF_DATE = "2026-08-01"
+
+# Projects where unparented PBIs are EXCLUDED (they must have a Feature/Epic parent).
+# Empty list = unparented PBIs are included everywhere; each becomes its own
+# feature group (story title = Business Area).
+UNPARENTED_EXCLUDE_PROJECTS = []
+
+DETAILS_BATCH = 50
+PARENTS_BATCH = 200
+
+grandparent_assignee_lookup = {}
+
+# Status ordering for sorting (lower = higher priority in display)
+STATUS_ORDER = {
+    "Done": 0,
+    "Testing": 1,
+    "Development": 2,
+    "Backlog": 3,
+}
+
+
+# ============================================================
+# AUTH
+# ============================================================
+
+def get_auth_header():
+    token = f":{PAT}"
+    encoded = base64.b64encode(token.encode("utf-8")).decode("utf-8")
+    return {"Authorization": f"Basic {encoded}", "Content-Type": "application/json"}
+
+
+# ============================================================
+# TFS API
+# ============================================================
+
+def run_wiql(query, top=5000):
+    url = f"{TFS_URL}/_apis/wit/wiql?api-version={API_VERSION}"
+    payload = {"query": query, "top": top}
+    resp = requests.post(url, json=payload, headers=get_auth_header(), timeout=60)
+    resp.raise_for_status()
+    return resp.json().get("workItems", [])
+
+
+def fetch_work_items_with_relations(ids):
+    if not ids:
+        return []
+    all_items = []
+    for i in range(0, len(ids), DETAILS_BATCH):
+        batch = ids[i:i + DETAILS_BATCH]
+        ids_param = ",".join(str(x) for x in batch)
+        batch_num = (i // DETAILS_BATCH) + 1
+        total = (len(ids) + DETAILS_BATCH - 1) // DETAILS_BATCH
+        print(f"      Batch {batch_num}/{total}: {len(batch)} items...")
+        url = (
+            f"{TFS_URL}/_apis/wit/workitems"
+            f"?ids={ids_param}&$expand=relations&api-version={API_VERSION}"
+        )
+        try:
+            resp = requests.get(url, headers=get_auth_header(), timeout=120)
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+            all_items.extend(resp.json().get("value", []))
+        except Exception as e:
+            print(f"      ERROR in batch {batch_num}: {e}")
+            print(f"      Retrying individually...")
+            for wid in batch:
+                try:
+                    url2 = f"{TFS_URL}/_apis/wit/workItems/{wid}?$expand=relations&api-version={API_VERSION}"
+                    r2 = requests.get(url2, headers=get_auth_header(), timeout=30)
+                    if r2.status_code == 200:
+                        all_items.append(r2.json())
+                except:
+                    print(f"      Skipped ID {wid}")
+    return all_items
+
+
+def fetch_work_items_basic(ids):
+    if not ids:
+        return {}
+    lookup = {}
+    for i in range(0, len(ids), PARENTS_BATCH):
+        batch = ids[i:i + PARENTS_BATCH]
+        ids_param = ",".join(str(x) for x in batch)
+        # No 'fields' restriction: fetches all populated fields so the
+        # Custom.* roadmap fields come through on any work item type.
+        url = (
+            f"{TFS_URL}/_apis/wit/workitems"
+            f"?ids={ids_param}&api-version={API_VERSION}"
+        )
+        try:
+            resp = requests.get(url, headers=get_auth_header(), timeout=60)
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+            for wi in resp.json().get("value", []):
+                flds = wi.get("fields", {})
+                lookup[wi["id"]] = {
+                    "title": flds.get("System.Title", ""),
+                    "type": flds.get("System.WorkItemType", ""),
+                    "assigned_to": extract_display_name(flds.get("System.AssignedTo")),
+                    "new_values": extract_new_values(flds),
+                }
+        except Exception as e:
+            print(f"      ERROR fetching parents: {e}")
+    return lookup
+
+
+# ============================================================
+# RELATIONS PARSING
+# ============================================================
+
+def extract_parent_id(relations):
+    if not relations:
+        return None
+    for rel in relations:
+        if rel.get("rel") == "System.LinkTypes.Hierarchy-Reverse":
+            url = rel.get("url", "")
+            parts = url.rstrip("/").split("/")
+            try:
+                return int(parts[-1])
+            except (ValueError, IndexError):
+                return None
+    return None
+
+
+def extract_child_ids(relations):
+    if not relations:
+        return []
+    children = []
+    for rel in relations:
+        if rel.get("rel") == "System.LinkTypes.Hierarchy-Forward":
+            url = rel.get("url", "")
+            parts = url.rstrip("/").split("/")
+            try:
+                children.append(int(parts[-1]))
+            except (ValueError, IndexError):
+                pass
+    return children
+
+
+# ============================================================
+# FIELD MAPPING HELPERS
+# ============================================================
+
+def strip_html(html_text):
+    if not html_text:
+        return ""
+    clean = re.sub(r"<[^>]+>", " ", html_text)
+    clean = clean.replace("&nbsp;", " ").replace("&amp;", "&")
+    clean = clean.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
+    clean = clean.replace("&#39;", "'")
+    return re.sub(r"\s+", " ", clean).strip()
+
+
+def extract_display_name(identity_field):
+    if not identity_field:
+        return ""
+    if isinstance(identity_field, dict):
+        return identity_field.get("displayName", "")
+    return str(identity_field)
+
+
+def format_date(date_string):
+    if not date_string:
+        return ""
+    try:
+        dt = datetime.fromisoformat(date_string.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d")
+    except:
+        return date_string
+
+
+def parse_date_for_cutoff(date_string):
+    if not date_string:
+        return None
+    try:
+        dt = datetime.fromisoformat(date_string.replace("Z", "+00:00"))
+        return dt.replace(tzinfo=None)
+    except:
+        return None
+
+
+def is_allowed_owner(display_name):
+    if not display_name:
+        return False
+    name_lower = display_name.lower()
+    for allowed in ALLOWED_OWNERS:
+        if allowed in name_lower:
+            return True
+    return False
+
+
+def map_status(state, working_status):
+    """Map TFS state + Custom.WorkingStatus to roadmap status.
+    Only 4 statuses: Backlog, Development, Testing, Done.
+    - New/Approved -> Backlog
+    - Committed + NOT testing -> Development
+    - Committed + Testing -> Testing
+    - Done -> Done
+    """
+    state_lower = (state or "").lower().strip()
+    ws_lower = (working_status or "").lower().strip()
+
+    if state_lower in ("new", "proposed", "approved"):
+        return "Backlog"
+
+    if state_lower in ("done", "closed"):
+        return "Done"
+
+    if state_lower in ("committed", "active", "in progress"):
+        if "test" in ws_lower:
+            return "Testing"
+        return "Development"
+
+    return "Backlog"
+
+
+def build_business_area_with_grandparent(parent_id, parent_lookup, grandparent_lookup):
+    if not parent_id or parent_id not in parent_lookup:
+        return ""
+    parent_info = parent_lookup[parent_id]
+    parent_title = parent_info["title"]
+    parent_type = parent_info["type"]
+    if parent_type == "Epic":
+        return parent_title
+    epic_title = grandparent_lookup.get(parent_id)
+    if epic_title:
+        return f"{epic_title} - {parent_title}"
+    return parent_title
+
+
+def extract_new_values(fields):
+    """Pull the new TFS roadmap fields (ticket number, business impact
+    value, category, impact level) from a work item's fields dict."""
+    vals = {}
+    for col, ref in NEW_FIELD_REFS.items():
+        raw = fields.get(ref) or ""
+        if isinstance(raw, dict):
+            raw = raw.get("displayName", "")
+        if ref in HTML_NEW_FIELDS:
+            raw = strip_html(str(raw))
+        vals[col] = str(raw).strip()
+    return vals
+
+
+def resolve_new_values(fields, parent_id, parent_lookup):
+    """Story-level values override feature-level values. A story with no
+    value of its own inherits the parent Feature's value for each field."""
+    own = extract_new_values(fields)
+    parent = parent_lookup.get(parent_id, {}).get("new_values", {}) if parent_id else {}
+    return {
+        col: (own.get(col, "") or parent.get(col, ""))
+        for col in NEW_FIELD_REFS
+    }
+
+
+# ============================================================
+# FETCH ALL WORK ITEMS
+# ============================================================
+
+def fetch_all_pbis():
+    types_filter = ", ".join(f"'{t}'" for t in PBI_TYPES)
+    projects_filter = ", ".join(f"'{p}'" for p in PROJECTS)
+    wiql = (
+        f"SELECT [System.Id] FROM WorkItems "
+        f"WHERE [System.TeamProject] IN ({projects_filter}) "
+        f"AND [System.WorkItemType] IN ({types_filter}) "
+        f"AND [System.State] <> 'Removed' "
+        f"ORDER BY [System.Id] DESC"
+    )
+    print(f"\n[1/5] Querying {PROJECTS} for {PBI_TYPES} (excluding Removed)...")
+    refs = run_wiql(wiql)
+    print(f"      Found {len(refs)} work items")
+    if not refs:
+        return []
+    all_ids = [r["id"] for r in refs]
+    print(f"\n      Fetching PBIs with relations...")
+    items = fetch_work_items_with_relations(all_ids)
+    print(f"      Fetched {len(items)} PBIs with relations")
+    return items
+
+
+def fetch_all_features_and_epics():
+    types_filter = ", ".join(f"'{t}'" for t in FEATURE_TYPES)
+    projects_filter = ", ".join(f"'{p}'" for p in PROJECTS)
+    wiql = (
+        f"SELECT [System.Id] FROM WorkItems "
+        f"WHERE [System.TeamProject] IN ({projects_filter}) "
+        f"AND [System.WorkItemType] IN ({types_filter}) "
+        f"AND [System.State] <> 'Removed' "
+        f"ORDER BY [System.Id] DESC"
+    )
+    print(f"\n[2/5] Querying {PROJECTS} for Features and Epics...")
+    refs = run_wiql(wiql)
+    print(f"      Found {len(refs)} Features/Epics")
+    if not refs:
+        return []
+    all_ids = [r["id"] for r in refs]
+    print(f"\n      Fetching Features/Epics with relations...")
+    items = fetch_work_items_with_relations(all_ids)
+    print(f"      Fetched {len(items)} items")
+    orphans = []
+    for wi in items:
+        relations = wi.get("relations", [])
+        children = extract_child_ids(relations)
+        if len(children) == 0:
+            orphans.append(wi)
+    print(f"      {len(orphans)} orphan Features/Epics (no children)")
+    return orphans
+
+
+# ============================================================
+# PARENT + GRANDPARENT LOOKUP
+# ============================================================
+
+def build_parent_and_grandparent_lookup(items, orphan_features):
+    parent_ids = set()
+    for wi in items:
+        relations = wi.get("relations", [])
+        pid = extract_parent_id(relations)
+        if pid:
+            parent_ids.add(pid)
+    orphan_parent_ids = set()
+    for wi in orphan_features:
+        relations = wi.get("relations", [])
+        pid = extract_parent_id(relations)
+        if pid:
+            orphan_parent_ids.add(pid)
+    all_parent_ids = parent_ids | orphan_parent_ids
+    print(f"      Fetching {len(all_parent_ids)} parent work items...")
+    parent_lookup = fetch_work_items_basic(list(all_parent_ids))
+    print(f"      {len(parent_lookup)} parents loaded")
+    grandparent_lookup = {}
+    gp_assignee = {}
+    feature_ids_to_check = []
+    for pid, info in parent_lookup.items():
+        if info["type"] == "Feature":
+            feature_ids_to_check.append(pid)
+    if feature_ids_to_check:
+        print(f"      Fetching {len(feature_ids_to_check)} Feature parents with relations...")
+        feature_items = fetch_work_items_with_relations(feature_ids_to_check)
+        grandparent_ids = set()
+        feature_to_grandparent_id = {}
+        for fi in feature_items:
+            fid = fi.get("id")
+            relations = fi.get("relations", [])
+            gpid = extract_parent_id(relations)
+            if gpid:
+                feature_to_grandparent_id[fid] = gpid
+                grandparent_ids.add(gpid)
+            else:
+                feature_to_grandparent_id[fid] = None
+        if grandparent_ids:
+            print(f"      Fetching {len(grandparent_ids)} Epic grandparents...")
+            grandparent_basic = fetch_work_items_basic(list(grandparent_ids))
+            for fid, gpid in feature_to_grandparent_id.items():
+                if gpid and gpid in grandparent_basic:
+                    grandparent_lookup[fid] = grandparent_basic[gpid]["title"]
+                    gp_assignee[fid] = grandparent_basic[gpid].get("assigned_to", "")
+                else:
+                    grandparent_lookup[fid] = None
+                    gp_assignee[fid] = None
+        else:
+            for fid in feature_ids_to_check:
+                grandparent_lookup[fid] = None
+                gp_assignee[fid] = None
+    return parent_lookup, grandparent_lookup, gp_assignee
+
+
+# ============================================================
+# ROW MAPPING
+# ============================================================
+
+def map_pbi_to_row(wi, parent_lookup, grandparent_lookup):
+    fields = wi.get("fields", {})
+    relations = wi.get("relations", [])
+    pbi_assignee = extract_display_name(fields.get("System.AssignedTo"))
+    module = fields.get("Custom.Module", "")
+    parent_id = extract_parent_id(relations)
+    feature = build_business_area_with_grandparent(parent_id, parent_lookup, grandparent_lookup)
+
+    # Unparented PBI — becomes its own feature group (same treatment as an orphan feature)
+    own_group = not feature
+    if own_group:
+        feature = fields.get("System.Title", "")
+
+    # Owner: check PBI -> parent Feature -> grandparent Epic
+    owner = ""
+    if pbi_assignee and is_allowed_owner(pbi_assignee):
+        owner = pbi_assignee
+    elif parent_id and parent_id in parent_lookup:
+        parent_assignee = parent_lookup[parent_id].get("assigned_to", "")
+        if parent_assignee and is_allowed_owner(parent_assignee):
+            owner = parent_assignee
+        else:
+            gp_assignee = grandparent_assignee_lookup.get(parent_id, "")
+            if gp_assignee and is_allowed_owner(gp_assignee):
+                owner = gp_assignee
+
+    requirement = fields.get("System.Title", "")
+    ref_id = str(wi.get("id", ""))
+    sync_id = str(wi.get("id", ""))
+    state = fields.get("System.State", "")
+    working_status = fields.get("Custom.WorkingStatus", "")
+    status = map_status(state, working_status)
+
+    # Priority from ADO
+    priority = fields.get("Microsoft.VSTS.Common.Priority", "")
+
+    # Added on = PBI created date
+    created_date = fields.get("System.CreatedDate", "")
+    added_on = format_date(created_date)
+
+    # Start date = ActivatedDate
+    start_date = ""
+    activated = fields.get("Microsoft.VSTS.Common.ActivatedDate", "")
+    if activated:
+        start_date = format_date(activated)
+
+    # Delivery date
+    delivery_date = ""
+    closed = fields.get("Microsoft.VSTS.Common.ClosedDate", "")
+    if closed:
+        delivery_date = format_date(closed)
+    elif state_lower_check(state):
+        state_change = fields.get("Microsoft.VSTS.Common.StateChangeDate", "")
+        if state_change:
+            delivery_date = format_date(state_change)
+
+    # Parent ID for grouping
+    parent_id_str = str(parent_id) if parent_id else ""
+
+    # New fields: story's own values, else inherited from parent Feature
+    new_vals = resolve_new_values(fields, parent_id, parent_lookup)
+
+    return {
+        "Owner": owner,
+        "Module": module,
+        "Business Area / Feature": feature,
+        "Requirement": requirement,
+        "Reference ID": ref_id,
+        "Ticket Number": new_vals.get("Ticket Number", ""),
+        "Priority": priority,
+        "Impact": new_vals.get("Impact", ""),
+        "Status": status,
+        "Added on": added_on,
+        "Start Date": start_date,
+        "Delivery Date": delivery_date,
+        "Stakeholder": "",
+        "Category": new_vals.get("Category", ""),
+        "Business Value": new_vals.get("Business Value", ""),
+        "Reviewed": "",
+        "_id": sync_id,
+        "_item_type": "story",
+        "_created_date": created_date,
+        "_parent_id": parent_id_str,
+        "_project": fields.get("System.TeamProject", ""),
+        "_own_group": own_group,
+    }
+
+
+def map_orphan_to_row(wi, parent_lookup, grandparent_lookup):
+    fields = wi.get("fields", {})
+    relations = wi.get("relations", [])
+    title = fields.get("System.Title", "")
+    owner = extract_display_name(fields.get("System.AssignedTo"))
+    module = fields.get("Custom.Module", "")
+    parent_id = extract_parent_id(relations)
+
+    if parent_id and parent_id in parent_lookup:
+        parent_info = parent_lookup[parent_id]
+        parent_title = parent_info["title"]
+        parent_type = parent_info["type"]
+        if parent_type == "Epic":
+            business_area = parent_title
+        elif parent_type == "Feature":
+            epic_title = grandparent_lookup.get(parent_id)
+            if epic_title:
+                business_area = f"{epic_title} - {parent_title}"
+            else:
+                business_area = parent_title
+        else:
+            business_area = parent_title
+    else:
+        business_area = title
+
+    created_date = fields.get("System.CreatedDate", "")
+    priority = fields.get("Microsoft.VSTS.Common.Priority", "")
+
+    # New fields: the feature's own values (inherited from its parent, if any)
+    new_vals = resolve_new_values(fields, parent_id, parent_lookup)
+
+    return {
+        "Owner": owner,
+        "Module": module,
+        "Business Area / Feature": business_area,
+        "Requirement": title,
+        "Reference ID": "",
+        "Ticket Number": new_vals.get("Ticket Number", ""),
+        "Priority": priority,
+        "Impact": new_vals.get("Impact", ""),
+        "Status": "Backlog",
+        "Added on": format_date(created_date),
+        "Start Date": "",
+        "Delivery Date": "",
+        "Stakeholder": "",
+        "Category": new_vals.get("Category", ""),
+        "Business Value": new_vals.get("Business Value", ""),
+        "Reviewed": "",
+        "_id": str(wi.get("id", "")),
+        "_item_type": "feature",
+        "_created_date": created_date,
+        "_parent_id": "",
+        "_project": fields.get("System.TeamProject", ""),
+        "_own_group": False,
+    }
+
+
+def state_lower_check(state):
+    return (state or "").lower().strip() in ("done", "closed")
+
+
+# ============================================================
+# FEATURE GROUP STATUS
+# ============================================================
+
+def compute_feature_group_status(rows):
+    """For each Business Area, compute the overall feature status.
+    Done = all stories are Done.
+    Testing = at least one story in Testing, rest Done/Testing.
+    Development = at least one in Development, rest Done/Testing/Development.
+    Backlog = at least one in Backlog.
+    Returns: {business_area: status}
+    """
+    area_statuses = defaultdict(list)
+    for r in rows:
+        ba = r.get("Business Area / Feature", "")
+        if ba:
+            area_statuses[ba].append(r.get("Status", "Backlog"))
+
+    result = {}
+    for ba, statuses in area_statuses.items():
+        if all(s == "Done" for s in statuses):
+            result[ba] = "Done"
+        elif any(s == "Testing" for s in statuses):
+            result[ba] = "Testing"
+        elif any(s == "Development" for s in statuses):
+            result[ba] = "Development"
+        else:
+            result[ba] = "Backlog"
+    return result
+
+
+# ============================================================
+# EXCEL GENERATION
+# ============================================================
+
+def generate_excel(rows):
+    print(f"\n      Generating Excel with {len(rows)} rows...")
+
+    # Compute feature group status for sorting and coloring
+    feature_status = compute_feature_group_status(rows)
+
+    # Sort: by feature group status (Done first), then by Business Area, then by status within group
+    rows.sort(key=lambda r: (
+        STATUS_ORDER.get(feature_status.get(r.get("Business Area / Feature", ""), "Backlog"), 99),
+        r.get("Business Area / Feature", "") or "~",
+        STATUS_ORDER.get(r.get("Status", "Backlog"), 99),
+        r.get("Requirement", "") or "",
+    ))
+
+    # --- New items computation (shared by Dashboard + New Stories sheet) ---
+    cutoff_dt = parse_date_for_cutoff(CUTOFF_DATE + "T00:00:00+00:00")
+    new_detail_rows = []
+    new_stories = 0
+    new_orphan_features = 0
+    features_with_new_stories = {}  # area -> {project, owner} of its first new story
+
+    for r in rows:
+        created = r.get("_created_date", "")
+        created_dt = parse_date_for_cutoff(created)
+        if not (created_dt and cutoff_dt and created_dt > cutoff_dt):
+            continue
+
+        if r.get("_item_type") == "story":
+            new_stories += 1
+            ba = r.get("Business Area / Feature", "")
+            if ba and not r.get("_own_group") and ba not in features_with_new_stories:
+                features_with_new_stories[ba] = {
+                    "project": r.get("_project", ""),
+                    "owner": r.get("Owner", ""),
+                }
+        else:
+            new_orphan_features += 1
+
+        new_detail_rows.append({
+            "Owner": r.get("Owner", ""),
+            "Project": r.get("_project", ""),
+            "Module": r.get("Module", ""),
+            "Feature": r.get("Business Area / Feature", ""),
+            "Story Title": r.get("Requirement", ""),
+            "Story ID": r.get("Reference ID", ""),
+            "Status": r.get("Status", ""),
+            "Added on": r.get("Added on", ""),
+            "_id": r.get("_id", ""),
+        })
+
+    # Order: Owner > Project > Module > Feature > Story Title > Story number
+    new_detail_rows.sort(key=lambda d: (
+        d["Owner"], d["Project"], d["Module"], d["Feature"],
+        d["Story Title"], d["_id"],
+    ))
+
+    # --- Completed since the new-items cutoff (stories set as Done) ---
+    completed_detail_rows = []
+    completed_counts = {}  # (project, owner) -> count
+    for r in rows:
+        if r.get("Status") != "Done" or r.get("_item_type") != "story":
+            continue
+        delivery = r.get("Delivery Date", "")
+        delivery_dt = parse_date_for_cutoff(delivery + "T00:00:00+00:00") if delivery else None
+        if not (delivery_dt and cutoff_dt and delivery_dt > cutoff_dt):
+            continue
+        k = (r.get("_project", ""), r.get("Owner", ""))
+        completed_counts[k] = completed_counts.get(k, 0) + 1
+        completed_detail_rows.append({
+            "Owner": r.get("Owner", ""),
+            "Project": r.get("_project", ""),
+            "Module": r.get("Module", ""),
+            "Feature": r.get("Business Area / Feature", ""),
+            "Story Title": r.get("Requirement", ""),
+            "Story ID": r.get("Reference ID", ""),
+            "Done Date": delivery,
+            "_id": r.get("_id", ""),
+        })
+
+    completed_detail_rows.sort(key=lambda d: (
+        d["Owner"], d["Project"], d["Module"], d["Feature"],
+        d["Story Title"], d["_id"],
+    ))
+
+    new_data = {
+        "new_stories": new_stories,
+        "new_orphan_features": new_orphan_features,
+        "features_with_new_stories": features_with_new_stories,
+        "new_features_total": new_orphan_features + len(features_with_new_stories),
+        "completed_counts": completed_counts,
+        "completed_total": len(completed_detail_rows),
+        "completed_detail_rows": completed_detail_rows,
+    }
+
+    wb = Workbook()
+
+    # --- DASHBOARD SHEET (created first = opens first) ---
+    dash_ws = wb.active
+    dash_ws.title = "Dashboard"
+    build_dashboard(dash_ws, rows, feature_status, new_data)
+
+    # --- ROADMAP SHEET ---
+    ws = wb.create_sheet("Roadmap", 1)
+    ws.sheet_properties.tabColor = "2F5496"
+
+    # Column definitions
+    columns = [
+        ("Owner", 28),
+        ("Module", 18),
+        ("Business Area / Feature", 40),
+        ("Requirement", 50),
+        ("Reference ID", 12),
+        ("Ticket Number", 14),
+        ("Priority", 10),
+        ("Impact", 12),
+        ("Status", 14),
+        ("Added on", 14),
+        ("Start Date", 14),
+        ("Delivery Date", 14),
+        ("Stakeholder", 25),
+        ("Category", 18),
+        ("Business Value", 35),
+        ("Reviewed", 10),
+    ]
+
+    header_font = Font(name="Segoe UI", bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill(start_color="2F5496", end_color="2F5496", fill_type="solid")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin_border = Border(
+        left=Side(style="thin", color="D9D9D9"),
+        right=Side(style="thin", color="D9D9D9"),
+        top=Side(style="thin", color="D9D9D9"),
+        bottom=Side(style="thin", color="D9D9D9"),
+    )
+
+    data_font = Font(name="Segoe UI", size=10)
+    data_align = Alignment(vertical="top", wrap_text=True)
+    feature_font = Font(name="Segoe UI", size=10, bold=True)
+    feature_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+
+    # Feature group fully done = greenish
+    done_group_fill = PatternFill(start_color="D5E8D4", end_color="D5E8D4", fill_type="solid")
+    done_feature_fill = PatternFill(start_color="C6E0B4", end_color="C6E0B4", fill_type="solid")
+
+    status_colors = {
+        "Backlog": PatternFill(start_color="E3F2FD", end_color="E3F2FD", fill_type="solid"),
+        "Development": PatternFill(start_color="FFF3E0", end_color="FFF3E0", fill_type="solid"),
+        "Testing": PatternFill(start_color="FCE4EC", end_color="FCE4EC", fill_type="solid"),
+        "Done": PatternFill(start_color="E8F5E9", end_color="E8F5E9", fill_type="solid"),
+    }
+
+    # Write header
+    for col_idx, (col_name, col_width) in enumerate(columns, 1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_align
+        cell.border = thin_border
+        ws.column_dimensions[get_column_letter(col_idx)].width = col_width
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}1"
+
+    # Write data rows
+    col_names = [c[0] for c in columns]
+    feature_col_idx = col_names.index("Business Area / Feature") + 1
+    status_col_idx = col_names.index("Status") + 1
+    num_cols = len(columns)
+
+    for row_idx, row_data in enumerate(rows, 2):
+        status = row_data.get("Status", "")
+        status_fill = status_colors.get(status)
+        ba = row_data.get("Business Area / Feature", "")
+        group_status = feature_status.get(ba, "Backlog")
+        is_done_group = (group_status == "Done")
+
+        for col_idx, (col_name, _) in enumerate(columns, 1):
+            value = row_data.get(col_name, "")
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.font = data_font
+            cell.alignment = data_align
+            cell.border = thin_border
+
+            # Determine fill
+            if col_idx == feature_col_idx:
+                cell.font = feature_font
+                cell.fill = done_feature_fill if is_done_group else feature_fill
+            elif is_done_group:
+                cell.fill = done_group_fill
+            elif status_fill and col_idx == status_col_idx:
+                cell.fill = status_fill
+
+    # Merge feature cells
+    print("      Merging feature cells...")
+    start_row = 2
+    current_feature = rows[0].get("Business Area / Feature", "") if rows else ""
+    for i in range(1, len(rows)):
+        feat = rows[i].get("Business Area / Feature", "")
+        if feat != current_feature:
+            end_row = i + 1
+            if end_row > start_row:
+                ws.merge_cells(
+                    start_row=start_row, start_column=feature_col_idx,
+                    end_row=end_row, end_column=feature_col_idx,
+                )
+            start_row = i + 2
+            current_feature = feat
+    if len(rows) > 0:
+        end_row = len(rows) + 1
+        if end_row > start_row:
+            ws.merge_cells(
+                start_row=start_row, start_column=feature_col_idx,
+                end_row=end_row, end_column=feature_col_idx,
+            )
+
+    # --- NEW STORIES SHEET (filterable detail table) ---
+    build_new_stories_sheet(wb, new_detail_rows)
+
+    # --- SUMMARY SHEET ---
+    summary_ws = wb.create_sheet("Summary")
+    summary_ws.sheet_properties.tabColor = "808080"
+    summary_ws.column_dimensions["A"].width = 30
+    summary_ws.column_dimensions["B"].width = 15
+    summary_font = Font(name="Segoe UI", bold=True, size=14, color="2F5496")
+    summary_ws.cell(row=1, column=1, value="Sync Summary").font = summary_font
+
+    status_counts_summary = defaultdict(int)
+    for r in rows:
+        status_counts_summary[r.get("Status", "Unknown")] += 1
+    owner_counts = defaultdict(int)
+    for r in rows:
+        owner_counts[r.get("Owner", "Unassigned")] += 1
+    module_counts = defaultdict(int)
+    for r in rows:
+        module_counts[r.get("Module", "Unknown")] += 1
+
+    summary_data = [
+        ("", ""),
+        ("Generated At:", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        ("TFS Server:", TFS_URL),
+        ("Projects:", ", ".join(PROJECTS)),
+        ("Roadmap Start Date:", ROADMAP_CUTOFF_DATE),
+        ("New Items Cutoff:", CUTOFF_DATE),
+        ("Total Items:", len(rows)),
+        ("", ""),
+        ("--- By Status ---", ""),
+    ]
+    for s, c in sorted(status_counts_summary.items(), key=lambda x: -x[1]):
+        summary_data.append((s, c))
+    summary_data.append(("", ""))
+    summary_data.append(("--- By Owner ---", ""))
+    for o, c in sorted(owner_counts.items(), key=lambda x: -x[1]):
+        summary_data.append((o, c))
+    summary_data.append(("", ""))
+    summary_data.append(("--- By Module ---", ""))
+    for m, c in sorted(module_counts.items(), key=lambda x: -x[1]):
+        summary_data.append((m, c))
+
+    for row_idx, (label, value) in enumerate(summary_data, 3):
+        c1 = summary_ws.cell(row=row_idx, column=1, value=label)
+        c1.font = Font(name="Segoe UI", bold=True, size=11)
+        c2 = summary_ws.cell(row=row_idx, column=2, value=value)
+        c2.font = Font(name="Segoe UI", size=11)
+
+    # Output file name includes the generation date & time
+    output_path = os.path.join(
+        OUTPUT_FOLDER,
+        f"roadmap_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.xlsx",
+    )
+    print(f"\n      Saving to: {output_path}")
+    try:
+        wb.save(output_path)
+        print(f"      Done!")
+        return output_path
+    except PermissionError:
+        # Same file name already open in Excel (re-run within the same minute) — add seconds
+        alt = output_path.replace(".xlsx", f"_{datetime.now().strftime('%S')}.xlsx")
+        wb.save(alt)
+        print(f"      WARNING: '{output_path}' is locked (close it in Excel).")
+        print(f"      Saved to fallback file instead: {alt}")
+        return alt
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
+
+def build_dashboard(dash_ws, rows, feature_status, new_data):
+    """Professional dashboard: overall + per-project status breakdown
+    (all tables reconcile with each other), and new items broken down
+    by project & owner. The filterable detail list lives on the
+    'New Stories' sheet."""
+
+    # --- Column widths ---
+    widths = {"A": 30, "B": 26, "C": 14, "D": 14, "E": 14, "F": 14, "G": 24}
+    for col, w in widths.items():
+        dash_ws.column_dimensions[col].width = w
+
+    # --- Style definitions ---
+    thin_b = Border(
+        left=Side(style="thin", color="D6D6D6"),
+        right=Side(style="thin", color="D6D6D6"),
+        top=Side(style="thin", color="D6D6D6"),
+        bottom=Side(style="thin", color="D6D6D6"),
+    )
+    title_font = Font(name="Segoe UI", bold=True, size=20, color="1F3864")
+    cutoff_font = Font(name="Segoe UI", bold=True, size=11, color="C00000")
+    meta_font = Font(name="Segoe UI", size=9, color="808080")
+    section_font = Font(name="Segoe UI", bold=True, size=11, color="FFFFFF")
+    section_fill = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")
+    hdr_font = Font(name="Segoe UI", bold=True, size=10)
+    hdr_fill = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
+    hdr_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    label_font = Font(name="Segoe UI", size=10)
+    num_font = Font(name="Segoe UI", size=10)
+    bold_font = Font(name="Segoe UI", size=10, bold=True)
+    total_font = Font(name="Segoe UI", size=10, bold=True, color="1F3864")
+    total_fill = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
+    data_align = Alignment(horizontal="center", vertical="center")
+    left_align = Alignment(horizontal="left", vertical="center")
+
+    status_fills = {
+        "Done": PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),
+        "Testing": PatternFill(start_color="FFCCC7", end_color="FFCCC7", fill_type="solid"),
+        "Development": PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),
+        "Backlog": PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid"),
+    }
+
+    dash_ws.sheet_properties.tabColor = "1F3864"
+
+    # --- Title block (roadmap cutoff shown prominently) ---
+    c = dash_ws.cell(row=1, column=1, value="Roadmap Dashboard")
+    c.font = title_font
+    dash_ws.merge_cells("A1:G1")
+    dash_ws.row_dimensions[1].height = 32
+
+    c = dash_ws.cell(row=2, column=1, value=f"Roadmap cutoff: {ROADMAP_CUTOFF_DATE} — stories completed before this date are excluded")
+    c.font = cutoff_font
+    dash_ws.merge_cells("A2:G2")
+
+    c = dash_ws.cell(row=3, column=1, value=f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}  |  Projects: {', '.join(PROJECTS)}  |  New items cutoff: {CUTOFF_DATE}")
+    c.font = meta_font
+    dash_ws.merge_cells("A3:G3")
+
+    status_order = ["Done", "Testing", "Development", "Backlog"]
+    cutoff_dt = parse_date_for_cutoff(CUTOFF_DATE + "T00:00:00+00:00")
+
+    # --- Shared counts (single source of truth — every table reconciles) ---
+    proj_stories = {p: defaultdict(int) for p in PROJECTS}
+    for r in rows:
+        if r.get("_item_type") == "story":
+            p = r.get("_project", "")
+            if p in proj_stories:
+                proj_stories[p][r.get("Status", "Other")] += 1
+
+    proj_areas = {p: set() for p in PROJECTS}
+    for r in rows:
+        if r.get("_own_group"):
+            continue  # standalone unparented story — its group is not a feature
+        p = r.get("_project", "")
+        ba = r.get("Business Area / Feature", "")
+        if p in proj_areas and ba:
+            proj_areas[p].add(ba)
+
+    story_status_totals = defaultdict(int)
+    for p in PROJECTS:
+        for s, cnt in proj_stories[p].items():
+            story_status_totals[s] += cnt
+    total_stories = sum(story_status_totals.values())
+    total_feature_groups = sum(len(proj_areas[p]) for p in PROJECTS)
+
+    # --- Small table helpers ---
+    def write_section(r, title, width):
+        c = dash_ws.cell(row=r, column=1, value=title)
+        c.font = section_font
+        c.fill = section_fill
+        dash_ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=width)
+        return r + 1
+
+    def write_table_header(r, headers):
+        for col_idx, h in enumerate(headers, 1):
+            c = dash_ws.cell(row=r, column=col_idx, value=h)
+            c.font = hdr_font
+            c.fill = hdr_fill
+            c.alignment = hdr_align
+            c.border = thin_b
+        return r + 1
+
+    def write_data_row(r, vals, fills=None, total=False):
+        for col_idx, val in enumerate(vals, 1):
+            c = dash_ws.cell(row=r, column=col_idx, value=val)
+            if total:
+                c.font = total_font
+                c.fill = total_fill
+            elif col_idx == 1:
+                c.font = bold_font
+            else:
+                c.font = num_font
+            c.alignment = left_align if col_idx == 1 else data_align
+            c.border = thin_b
+            if fills and not total:
+                f = fills.get(col_idx)
+                if f:
+                    c.fill = f
+        return r + 1
+
+    # --- Section 1: Overall Status Breakdown ---
+    row = 5
+    row = write_section(row, "Overall Status Breakdown", 3)
+    row = write_table_header(row, ["Status", "Stories", "Feature Groups"])
+
+    for status in status_order:
+        s = story_status_totals.get(status, 0)
+        f = 0
+        for p in PROJECTS:
+            for area in proj_areas[p]:
+                if feature_status.get(area, "Backlog") == status:
+                    f += 1
+        fill = status_fills.get(status)
+        row = write_data_row(row, [status, s, f],
+                             fills={1: fill, 2: fill, 3: fill} if fill else None)
+    row = write_data_row(row, ["Total", total_stories, total_feature_groups], total=True)
+
+    # --- Section 2: Status Breakdown by Project (reconciles with Section 1) ---
+    row += 2
+    row = write_section(row, "Status Breakdown by Project", 7)
+    row = write_table_header(row, ["Project", "Done", "Testing", "Development", "Backlog", "Stories", "Feature Groups"])
+
+    for proj in PROJECTS:
+        counts = proj_stories.get(proj, defaultdict(int))
+        vals = [proj] + [counts.get(s, 0) for s in status_order] \
+               + [sum(counts.values()), len(proj_areas.get(proj, set()))]
+        row = write_data_row(row, vals)
+    row = write_data_row(
+        row,
+        ["Total"] + [story_status_totals.get(s, 0) for s in status_order]
+        + [total_stories, total_feature_groups],
+        total=True,
+    )
+
+    # --- Section 3: New Items broken down by Project & Owner ---
+    row += 2
+    row = write_section(row, f"New Items After {CUTOFF_DATE} — by Project & Owner", 4)
+    row = write_table_header(row, ["Project", "Owner", "New Stories", "New Features"])
+
+    # Per (project, owner) counts — sums reconcile with the totals below
+    po = {}  # (project, owner) -> [new stories, new features]
+    for r in rows:
+        created = r.get("_created_date", "")
+        created_dt = parse_date_for_cutoff(created)
+        if not (created_dt and cutoff_dt and created_dt > cutoff_dt):
+            continue
+        k = (r.get("_project", ""), r.get("Owner", ""))
+        if k not in po:
+            po[k] = [0, 0]
+        if r.get("_item_type") == "story":
+            po[k][0] += 1
+        else:
+            po[k][1] += 1  # new orphan feature
+
+    # Features that gained new stories — attributed to the first new story's project/owner
+    for info in new_data["features_with_new_stories"].values():
+        k = (info.get("project", ""), info.get("owner", ""))
+        if k not in po:
+            po[k] = [0, 0]
+        po[k][1] += 1
+
+    proj_order = {p: i for i, p in enumerate(PROJECTS)}
+    for k in sorted(po.keys(), key=lambda x: (proj_order.get(x[0], 99), x[1])):
+        row = write_data_row(row, [k[0], k[1], po[k][0], po[k][1]])
+
+    row = write_data_row(
+        row,
+        ["Total", "", new_data["new_stories"], new_data["new_features_total"]],
+        total=True,
+    )
+
+    # Pointer to the filterable detail sheet
+    row += 1
+    c = dash_ws.cell(row=row, column=1,
+                     value=f"Full filterable list: see the 'New Stories' sheet (items created after {CUTOFF_DATE})")
+    c.font = Font(name="Segoe UI", size=9, italic=True, color="808080")
+    dash_ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
+
+    # --- Section 4: Completed After Cutoff (counts by project & owner + list) ---
+    row += 2
+    row = write_section(row, f"Completed After {CUTOFF_DATE} — Stories Set as Done", 4)
+    row = write_table_header(row, ["Project", "Owner", "Completed Stories"])
+
+    completed_counts = new_data.get("completed_counts", {})
+    for k in sorted(completed_counts.keys(), key=lambda x: (proj_order.get(x[0], 99), x[1])):
+        row = write_data_row(row, [k[0], k[1], completed_counts[k]])
+
+    row = write_data_row(row, ["Total", "", new_data.get("completed_total", 0)], total=True)
+
+    # The completed list, under the counts
+    completed_list = new_data.get("completed_detail_rows", [])
+    if completed_list:
+        row += 2
+        row = write_table_header(row, ["Owner", "Story Title", "Done Date", "Story ID", "Project", "Module", "Feature"])
+        list_font = Font(name="Segoe UI", size=10)
+        list_align = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        for d in completed_list:
+            vals = [d["Owner"], d["Story Title"], d["Done Date"], d["Story ID"],
+                    d["Project"], d["Module"], d["Feature"]]
+            for col_idx, val in enumerate(vals, 1):
+                c = dash_ws.cell(row=row, column=col_idx, value=val)
+                c.font = list_font
+                c.alignment = list_align
+                c.border = thin_b
+            row += 1
+    else:
+        row += 1
+        c = dash_ws.cell(row=row, column=1, value=f"No stories completed after {CUTOFF_DATE}")
+        c.font = Font(name="Segoe UI", size=10, italic=True, color="999999")
+
+    dash_ws.freeze_panes = "A4"
+
+
+def build_new_stories_sheet(wb, detail_rows):
+    """Dedicated sheet holding the new stories/features as a real Excel
+    Table (filter dropdowns + banded rows), ordered:
+    Owner > Project > Module > Feature > Story Title > Story number."""
+    ws = wb.create_sheet("New Stories", 2)
+    ws.sheet_properties.tabColor = "70AD47"
+
+    headers = ["Owner", "Project", "Module", "Feature", "Story Title", "Story ID", "Status", "Added on"]
+    widths = [30, 20, 20, 42, 55, 12, 13, 13]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    thin_b = Border(
+        left=Side(style="thin", color="D6D6D6"),
+        right=Side(style="thin", color="D6D6D6"),
+        top=Side(style="thin", color="D6D6D6"),
+        bottom=Side(style="thin", color="D6D6D6"),
+    )
+    title_font = Font(name="Segoe UI", bold=True, size=14, color="1F3864")
+    hdr_font = Font(name="Segoe UI", bold=True, size=10, color="FFFFFF")
+    hdr_fill = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")
+    hdr_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    c = ws.cell(row=1, column=1, value=f"New Stories & Features — Created After {CUTOFF_DATE}")
+    c.font = title_font
+    ws.merge_cells("A1:H1")
+
+    header_row = 3
+
+    if detail_rows:
+        for col_idx, h in enumerate(headers, 1):
+            c = ws.cell(row=header_row, column=col_idx, value=h)
+            c.font = hdr_font
+            c.fill = hdr_fill
+            c.alignment = hdr_align
+            c.border = thin_b
+
+        data_font = Font(name="Segoe UI", size=10)
+        data_align = Alignment(vertical="top", wrap_text=True)
+
+        r = header_row + 1
+        for d in detail_rows:
+            vals = [d["Owner"], d["Project"], d["Module"], d["Feature"],
+                    d["Story Title"], d["Story ID"], d["Status"], d["Added on"]]
+            for col_idx, val in enumerate(vals, 1):
+                c = ws.cell(row=r, column=col_idx, value=val)
+                c.font = data_font
+                c.alignment = data_align
+                c.border = thin_b
+            r += 1
+        last_row = r - 1
+
+        # Real Excel Table -> filter dropdowns + banded styling
+        tab = Table(displayName="NewStoriesTable", ref=f"A{header_row}:H{last_row}")
+        tab.tableColumns = [TableColumn(id=i + 1, name=h) for i, h in enumerate(headers)]
+        tab.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2",
+            showRowStripes=True,
+            showColumnStripes=False,
+            showFirstColumn=False,
+            showLastColumn=False,
+        )
+        ws.add_table(tab)
+        ws.freeze_panes = f"A{header_row + 1}"
+    else:
+        c = ws.cell(row=header_row, column=1,
+                    value=f"No new stories or features created after {CUTOFF_DATE}")
+        c.font = Font(name="Segoe UI", size=10, italic=True, color="999999")
+
+
+# ============================================================
+# DATE WIZARD
+# ============================================================
+
+def prompt_cutoff_dates():
+    """Ask the user for the two cutoff dates before running.
+    ENTER keeps the configured default. Input must be YYYY-MM-DD."""
+    global CUTOFF_DATE, ROADMAP_CUTOFF_DATE
+
+    def ask(question, current):
+        print(f"\n  {question}")
+        while True:
+            try:
+                raw = input(f"  Date YYYY-MM-DD (ENTER = keep {current}): ").strip()
+            except EOFError:
+                return current
+            if not raw:
+                return current
+            try:
+                return datetime.strptime(raw, "%Y-%m-%d").strftime("%Y-%m-%d")
+            except ValueError:
+                print(f"      Invalid date '{raw}' — expected YYYY-MM-DD, try again.")
+
+    print("\n" + "-" * 60)
+    print("  Roadmap dates — press ENTER to keep the current value")
+    print("-" * 60)
+    ROADMAP_CUTOFF_DATE = ask(
+        "1) When should the roadmap start? (stories completed before this date are excluded)",
+        ROADMAP_CUTOFF_DATE,
+    )
+    CUTOFF_DATE = ask(
+        "2) When to count new items added to the roadmap? (dashboard 'new items' threshold)",
+        CUTOFF_DATE,
+    )
+    print(f"\n  Roadmap start date:     {ROADMAP_CUTOFF_DATE}")
+    print(f"  New items counted from: {CUTOFF_DATE}")
+    print("-" * 60)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    print("=" * 60)
+    print("  ADO Roadmap Sync v6")
+    print("  TFS: " + TFS_URL)
+    print(f"  Projects: {', '.join(PROJECTS)}")
+    print("=" * 60)
+
+    # Date wizard (skip with --defaults)
+    if "--defaults" in sys.argv:
+        print(f"\n  --defaults: skipping the date wizard.")
+        print(f"  Roadmap start date:     {ROADMAP_CUTOFF_DATE}")
+        print(f"  New items counted from: {CUTOFF_DATE}")
+    else:
+        prompt_cutoff_dates()
+
+    if PAT == "YOUR_PAT_HERE" or not PAT:
+        print("\nERROR: No PAT configured!")
+        sys.exit(1)
+
+    try:
+        # 1. Fetch PBIs
+        pbi_items = fetch_all_pbis()
+
+        # 2. Fetch orphan Features/Epics
+        orphan_items = fetch_all_features_and_epics()
+
+        # 3. Build parent + grandparent lookup
+        print(f"\n[3/5] Building parent and grandparent (Epic) lookup...")
+        parent_lookup, grandparent_lookup, gp_assignee = build_parent_and_grandparent_lookup(
+            pbi_items, orphan_items
+        )
+        global grandparent_assignee_lookup
+        grandparent_assignee_lookup = gp_assignee
+        print(f"      Parent lookup: {len(parent_lookup)} items")
+
+        # 4. Map + filter
+        print(f"\n[4/5] Mapping work items and filtering...")
+        print(f"      Roadmap cutoff: {ROADMAP_CUTOFF_DATE} (stories done before this are excluded)")
+        all_rows = []
+        skipped_no_parent = 0
+        skipped_no_owner = 0
+        skipped_done_before_cutoff = 0
+
+        roadmap_cutoff_dt = parse_date_for_cutoff(ROADMAP_CUTOFF_DATE + "T00:00:00+00:00")
+
+        for wi in pbi_items:
+            # Exclude unparented PBIs — but only in configured projects
+            # (HMIS stories live under Features; HR/Mobile/Websites PBIs are
+            #  mostly top-level, so they are kept and become their own group)
+            relations = wi.get("relations", [])
+            parent_id = extract_parent_id(relations)
+            wi_project = wi.get("fields", {}).get("System.TeamProject", "")
+            if not parent_id and wi_project in UNPARENTED_EXCLUDE_PROJECTS:
+                skipped_no_parent += 1
+                continue
+
+            row = map_pbi_to_row(wi, parent_lookup, grandparent_lookup)
+            if not row["Owner"]:
+                skipped_no_owner += 1
+                continue
+
+            # Exclude stories done before roadmap cutoff
+            if row["Status"] == "Done" and row["Delivery Date"]:
+                delivery_dt = parse_date_for_cutoff(row["Delivery Date"] + "T00:00:00+00:00")
+                if delivery_dt and roadmap_cutoff_dt and delivery_dt < roadmap_cutoff_dt:
+                    skipped_done_before_cutoff += 1
+                    continue
+
+            all_rows.append(row)
+
+        for wi in orphan_items:
+            row = map_orphan_to_row(wi, parent_lookup, grandparent_lookup)
+            if not (row["Owner"] and is_allowed_owner(row["Owner"])):
+                skipped_no_owner += 1
+                continue
+
+            # Orphan features are Backlog status — never excluded by cutoff
+            all_rows.append(row)
+
+        print(f"      {len(all_rows)} items included")
+        print(f"      {skipped_no_parent} PBIs skipped (unparented)")
+        print(f"      {skipped_no_owner} items skipped (no allowed owner in hierarchy)")
+        print(f"      {skipped_done_before_cutoff} stories skipped (done before {ROADMAP_CUTOFF_DATE})")
+
+        # Diagnostics: how many rows have the new TFS fields populated
+        for col in NEW_FIELD_REFS:
+            n = sum(1 for r in all_rows if str(r.get(col, "") or "").strip())
+            print(f"      '{col}' populated on {n} rows")
+
+        if not all_rows:
+            print("\nNo work items match criteria. Exiting.")
+            sys.exit(0)
+
+        # 5. Generate Excel — fresh build from TFS every run, no carry-over
+        print(f"\n[5/5] Generating Excel...")
+        output_file = generate_excel(all_rows)
+
+        print(f"\n{'=' * 60}")
+        print(f"  SYNC COMPLETE")
+        print(f"  Total items in roadmap: {len(all_rows)}")
+        print(f"  Output: {output_file}")
+        print(f"{'=' * 60}")
+
+    except requests.exceptions.ConnectionError:
+        print(f"\nERROR: Cannot connect to TFS at {TFS_URL}")
+        sys.exit(1)
+    except requests.exceptions.HTTPError as e:
+        print(f"\nERROR: HTTP {e.response.status_code}: {e}")
+        if e.response.status_code == 401:
+            print("   Authentication failed. Check your PAT.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\nERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
