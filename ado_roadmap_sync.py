@@ -1130,6 +1130,9 @@ def generate_excel(rows):
     # --- NEW STORIES SHEET (filterable detail table) ---
     build_new_stories_sheet(wb, new_detail_rows)
 
+    # --- COMPLETED STORIES SHEET (delivered to the PO since the cutoff) ---
+    build_completed_stories_sheet(wb, new_data.get("completed_detail_rows", []))
+
     # --- TICKETS SHEET (ticket system analysis detail table) ---
     build_tickets_sheet(wb, ticket_data)
 
@@ -1400,7 +1403,7 @@ def build_dashboard(dash_ws, rows, feature_status, new_data, ticket_data=None):
     c.font = Font(name="Segoe UI", size=9, italic=True, color="808080")
     dash_ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
 
-    # --- Section 4: Completed After Cutoff (counts by project & owner + list) ---
+    # --- Section 4: Completed After Cutoff (counts by project & owner) ---
     row += 2
     row = write_section(row, f"Completed After {CUTOFF_DATE} — Stories Set as Done", 4)
     row = write_table_header(row, ["Project", "Owner", "Completed Stories"])
@@ -1411,26 +1414,17 @@ def build_dashboard(dash_ws, rows, feature_status, new_data, ticket_data=None):
 
     row = write_data_row(row, ["Total", "", new_data.get("completed_total", 0)], total=True)
 
-    # The completed list, under the counts
+    # Pointer to the dedicated detail sheet
     completed_list = new_data.get("completed_detail_rows", [])
+    row += 1
     if completed_list:
-        row += 2
-        row = write_table_header(row, ["Owner", "Story Title", "Done Date", "Story ID", "Project", "Module", "Feature"])
-        list_font = Font(name="Segoe UI", size=10)
-        list_align = Alignment(horizontal="left", vertical="top", wrap_text=True)
-        for d in completed_list:
-            vals = [d["Owner"], d["Story Title"], d["Done Date"], d["Story ID"],
-                    d["Project"], d["Module"], d["Feature"]]
-            for col_idx, val in enumerate(vals, 1):
-                c = dash_ws.cell(row=row, column=col_idx, value=val)
-                c.font = list_font
-                c.alignment = list_align
-                c.border = thin_b
-            row += 1
+        c = dash_ws.cell(row=row, column=1,
+                         value=f"Full list: see the 'Completed Stories' sheet "
+                               f"({len(completed_list)} user stories delivered to the PO since {CUTOFF_DATE})")
     else:
-        row += 1
         c = dash_ws.cell(row=row, column=1, value=f"No stories completed after {CUTOFF_DATE}")
-        c.font = Font(name="Segoe UI", size=10, italic=True, color="999999")
+    c.font = Font(name="Segoe UI", size=9, italic=True, color="808080" if completed_list else "999999")
+    dash_ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
 
     # --- Section 5: Ticket System Analysis (work in progress) ---
     row += 2
@@ -1590,13 +1584,91 @@ def build_new_stories_sheet(wb, detail_rows):
         c.font = Font(name="Segoe UI", size=10, italic=True, color="999999")
 
 
+def build_completed_stories_sheet(wb, detail_rows):
+    """Dedicated 'Completed Stories' sheet: user stories delivered to the
+    PO since the cutoff, as a real Excel Table (filter dropdowns + banded
+    rows), ordered: Owner > Project > Module > Feature > Story Title >
+    Story number."""
+    ws = wb.create_sheet("Completed Stories", 3)
+    ws.sheet_properties.tabColor = "548235"
+
+    headers = ["Owner", "Project", "Module", "Feature", "Story Title", "Story ID", "Done Date"]
+    widths = [30, 20, 20, 42, 55, 12, 13]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    thin_b = Border(
+        left=Side(style="thin", color="D6D6D6"),
+        right=Side(style="thin", color="D6D6D6"),
+        top=Side(style="thin", color="D6D6D6"),
+        bottom=Side(style="thin", color="D6D6D6"),
+    )
+    title_font = Font(name="Segoe UI", bold=True, size=14, color="1F3864")
+    meta_font = Font(name="Segoe UI", size=9, color="808080")
+    hdr_font = Font(name="Segoe UI", bold=True, size=10, color="FFFFFF")
+    hdr_fill = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")
+    hdr_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    c = ws.cell(row=1, column=1,
+                value="List of user stories delivered to the PO since the cut off")
+    c.font = title_font
+    ws.merge_cells("A1:G1")
+
+    c = ws.cell(row=2, column=1,
+                value=f"Stories set as Done after {CUTOFF_DATE}  |  {len(detail_rows)} user stories")
+    c.font = meta_font
+    ws.merge_cells("A2:G2")
+
+    header_row = 4
+
+    if detail_rows:
+        for col_idx, h in enumerate(headers, 1):
+            c = ws.cell(row=header_row, column=col_idx, value=h)
+            c.font = hdr_font
+            c.fill = hdr_fill
+            c.alignment = hdr_align
+            c.border = thin_b
+
+        data_font = Font(name="Segoe UI", size=10)
+        data_align = Alignment(vertical="top", wrap_text=True)
+
+        r = header_row + 1
+        for d in detail_rows:
+            vals = [d["Owner"], d["Project"], d["Module"], d["Feature"],
+                    d["Story Title"], d["Story ID"], d["Done Date"]]
+            for col_idx, val in enumerate(vals, 1):
+                c = ws.cell(row=r, column=col_idx, value=val)
+                c.font = data_font
+                c.alignment = data_align
+                c.border = thin_b
+            r += 1
+        last_row = r - 1
+
+        # Real Excel Table -> filter dropdowns + banded styling
+        tab = Table(displayName="CompletedStoriesTable", ref=f"A{header_row}:G{last_row}")
+        tab.tableColumns = [TableColumn(id=i + 1, name=h) for i, h in enumerate(headers)]
+        tab.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2",
+            showRowStripes=True,
+            showColumnStripes=False,
+            showFirstColumn=False,
+            showLastColumn=False,
+        )
+        ws.add_table(tab)
+        ws.freeze_panes = f"A{header_row + 1}"
+    else:
+        c = ws.cell(row=header_row, column=1,
+                    value=f"No user stories delivered to the PO since {CUTOFF_DATE}")
+        c.font = Font(name="Segoe UI", size=10, italic=True, color="999999")
+
+
 def build_tickets_sheet(wb, ticket_data):
     """Dedicated 'Tickets' sheet: every ticket from the ticket system
     export with name, severity, number, status and a 'Covered by
     Roadmap' flag — as a real Excel Table (filter dropdowns + banded
     rows). Sorted by severity, then not-covered first, then ticket
     number. Skipped gracefully when the export is unavailable."""
-    ws = wb.create_sheet("Tickets", 3)
+    ws = wb.create_sheet("Tickets", 4)
     ws.sheet_properties.tabColor = "C55A11"
 
     headers = ["Ticket Name", "Severity", "Ticket Number", "Status", "Covered by Roadmap"]

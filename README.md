@@ -108,7 +108,7 @@ Owner resolution for stories: own assignee → parent Feature assignee → grand
 1. **Overall Status Breakdown** — stories + feature groups per status
 2. **Status Breakdown by Project** — reconciles with table 1
 3. **New Items After CUTOFF — by Project & Owner** (+ filterable "New Stories" sheet)
-4. **Completed After CUTOFF — by Project & Owner** (+ full list below)
+4. **Completed After CUTOFF — by Project & Owner** (full list on the "Completed Stories" sheet)
 5. **Ticket System Analysis (Work in Progress)** — tickets per severity + covered / not covered, a breakdown per module, and a note that only the covered count is accurate (tickets marked "Not Covered" may still be covered but not yet linked to a PBI or Feature in Azure DevOps)
 
 ## Ticket system analysis (v7+)
@@ -161,8 +161,9 @@ To disable ticket analysis set `TICKET_EXPORT_FOLDER = ""`. To use a specific ex
 1. **Dashboard** — status breakdown, new items, completed items, ticket analysis
 2. **Roadmap** — main data with merged feature cells, color-coded status
 3. **New Stories** — filterable Excel table of items created after CUTOFF_DATE
-4. **Tickets** — ticket system analysis: every ticket with covered-by-roadmap flag
-5. **Summary** — counts by status, owner, module
+4. **Completed Stories** — "List of user stories delivered to the PO since the cut off": filterable Excel table of stories set as Done after CUTOFF_DATE
+5. **Tickets** — ticket system analysis: every ticket with covered-by-roadmap flag
+6. **Summary** — counts by status, owner, module
 
 ## Configuration
 
