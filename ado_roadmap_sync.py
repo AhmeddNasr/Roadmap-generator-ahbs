@@ -1,8 +1,16 @@
 # ============================================================
-# ADO Roadmap Sync Script v6
+# ADO Roadmap Sync Script v7
 # Pulls Product Backlog Items + orphan Features/Epics
 # from HMIS (TFS on-prem) and generates a roadmap Excel
 # matching the original format, with a Dashboard sheet.
+#
+# New in v7: ticket system analysis. Ticket numbers linked to
+# Features/PBIs (Custom.Ticketnumber — the lowest level PBI
+# overrides the Feature value) are matched against the ticket
+# system export Excel. A new 'Tickets' sheet lists every
+# ticket with name, severity, number, status and a
+# 'Covered by Roadmap' flag; the Dashboard shows tickets per
+# severity and covered/not-covered counts.
 #
 # New in v6: no carry-over — the roadmap is built completely
 # fresh from TFS on every run.
@@ -24,9 +32,11 @@ import base64
 import re
 import os
 import sys
+import fnmatch
+import warnings
 from datetime import datetime
 from collections import defaultdict
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo, TableColumn
@@ -82,6 +92,40 @@ ROADMAP_CUTOFF_DATE = "2026-08-01"
 # Empty list = unparented PBIs are included everywhere; each becomes its own
 # feature group (story title = Business Area).
 UNPARENTED_EXCLUDE_PROJECTS = []
+
+# Ticket system analysis: the script reads the ticket export Excel generated
+# by the ticket system. TICKET_EXPORT_FOLDER may be a FOLDER (the newest file
+# matching TICKET_EXPORT_PATTERN inside it is used) or a direct FILE path.
+# By default the ticket export is expected in the SAME FOLDER as this script.
+# Set TICKET_EXPORT_FOLDER = "" to disable ticket analysis.
+TICKET_EXPORT_FOLDER = OUTPUT_FOLDER
+TICKET_EXPORT_PATTERN = "Active All Requests*"
+
+# Display order for ticket severities (matched by keyword, so emoji prefixes
+# like 🟥 / 🟦 in the export values are handled automatically).
+SEVERITY_ORDER = ["Critical", "High", "Medium", "Normal"]
+
+# Column names in the ticket export (header row, matched case-insensitively)
+TICKET_EXPORT_COLUMNS = {
+    "number": ["ID"],
+    "name": ["Subject", "Title"],
+    "severity": ["Priority", "Severity"],
+    "status": ["Status"],
+    "request_type": ["Request Type", "Type"],
+    "module": ["Subcategory", "Module"],
+}
+
+# Only tickets matching these are tracked in the analysis:
+# - Request Type must be one of TICKET_REQUEST_TYPES (exact, case-insensitive)
+# - Status must contain one of TICKET_ALLOWED_STATUS_KEYWORDS
+#   (emoji prefixes like 🚩 are ignored — 'Open'/'New' and 'Committed' are kept,
+#   anything else — On hold / Resolved / Cancelled / Closed / Rejected — is excluded)
+TICKET_REQUEST_TYPES = ["CR"]
+TICKET_ALLOWED_STATUS_KEYWORDS = ["committed", "open", "new"]
+
+# Ticket numbers referenced by the roadmap but missing from the ticket export
+# are listed on the dashboard up to this many
+TICKET_MISSING_LIST_MAX = 20
 
 DETAILS_BATCH = 50
 PARENTS_BATCH = 200
@@ -631,6 +675,236 @@ def compute_feature_group_status(rows):
 
 
 # ============================================================
+# TICKET SYSTEM ANALYSIS
+# ============================================================
+
+def normalize_ticket_id(value):
+    """Normalize a ticket number to a plain string ('5487', whether it
+    comes as int, float or str)."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, int):
+        return str(value)
+    s = str(value).strip()
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    if s.isdigit():
+        return str(int(s))
+    return s
+
+
+def parse_ticket_numbers(value):
+    """Extract ticket numbers from a Ticket Number field value.
+    Handles HTML remnants, commas, spaces and multiple numbers
+    (e.g. '4537, 3004'). Returns unique normalized numbers, in order."""
+    if value is None:
+        return []
+    text = strip_html(str(value))
+    if not text:
+        return []
+    result = []
+    for num in re.findall(r"\d+", text):
+        n = normalize_ticket_id(num)
+        if n and n not in result:
+            result.append(n)
+    return result
+
+
+def severity_sort_key(severity):
+    """Sort key for severities: SEVERITY_ORDER keywords first (by name),
+    unknown values last (alphabetically)."""
+    s = str(severity or "").lower()
+    for i, name in enumerate(SEVERITY_ORDER):
+        if name.lower() in s:
+            return (0, i, s)
+    return (1, 1, s)
+
+
+def ticket_number_sort_key(number):
+    """Numeric sort for ticket numbers ('3004' < '10000' < 'abc')."""
+    n = str(number or "")
+    return (0, int(n), "") if n.isdigit() else (1, 0, n)
+
+
+def find_latest_ticket_export():
+    """Locate the ticket system export Excel.
+    TICKET_EXPORT_FOLDER can be a direct file path, or a folder in which
+    the newest file matching TICKET_EXPORT_PATTERN is used.
+    Returns the path or None if not found/disabled."""
+    if not TICKET_EXPORT_FOLDER:
+        return None
+    path = os.path.expanduser(TICKET_EXPORT_FOLDER)
+    if os.path.isfile(path):
+        return path
+    if not os.path.isdir(path):
+        return None
+    try:
+        files = [
+            f for f in os.listdir(path)
+            if fnmatch.fnmatch(f, TICKET_EXPORT_PATTERN)
+            and f.lower().endswith(".xlsx")
+            and not f.startswith("~$")
+        ]
+    except OSError:
+        return None
+    if not files:
+        return None
+    files.sort(key=lambda f: os.path.getmtime(os.path.join(path, f)), reverse=True)
+    return os.path.join(path, files[0])
+
+
+def load_ticket_export(path):
+    """Read the ticket system export and return a list of ticket dicts:
+    {number, name, severity, status}. Columns are located by header name.
+    Returns None if no sheet with the expected headers is found."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            twb = load_workbook(path, read_only=True, data_only=True)
+    except Exception as e:
+        print(f"      ERROR reading ticket export: {e}")
+        return None
+
+    try:
+        for sheet_name in twb.sheetnames:
+            if "hidden" in sheet_name.lower():
+                continue
+            sheet = twb[sheet_name]
+            header = [
+                (str(c.value).strip() if c.value is not None else "")
+                for c in next(sheet.iter_rows(max_row=1))
+            ]
+            if not header:
+                continue
+            col_map = {}
+            for field, aliases in TICKET_EXPORT_COLUMNS.items():
+                for idx, h in enumerate(header):
+                    if h.lower() in [a.lower() for a in aliases]:
+                        col_map[field] = idx
+                        break
+            if "number" in col_map and "name" in col_map:
+                tickets = []
+                get = lambda row, key: (row[col_map[key]] if key in col_map and col_map[key] < len(row) else None)
+                for row in sheet.iter_rows(min_row=2, values_only=True):
+                    number = normalize_ticket_id(get(row, "number"))
+                    if not number:
+                        continue
+                    tickets.append({
+                        "number": number,
+                        "name": str(get(row, "name") or ""),
+                        "severity": str(get(row, "severity") or "") or "Unknown",
+                        "status": str(get(row, "status") or "") or "Unknown",
+                        "request_type": str(get(row, "request_type") or "").strip(),
+                        "module": str(get(row, "module") or "").strip() or "Unknown",
+                    })
+                return tickets
+        return None
+    finally:
+        twb.close()
+
+
+def is_tracked_ticket(ticket):
+    """A ticket is tracked only if its Request Type is one of
+    TICKET_REQUEST_TYPES and its Status contains one of
+    TICKET_ALLOWED_STATUS_KEYWORDS (emoji prefixes are ignored —
+    e.g. '🚩Open' counts as 'Open')."""
+    allowed_types = [t.lower() for t in TICKET_REQUEST_TYPES]
+    rt = str(ticket.get("request_type", "")).strip().lower()
+    if allowed_types and rt not in allowed_types:
+        return False
+    if TICKET_ALLOWED_STATUS_KEYWORDS:
+        st = str(ticket.get("status", "")).strip().lower()
+        if not any(k in st for k in [s.lower() for s in TICKET_ALLOWED_STATUS_KEYWORDS]):
+            return False
+    return True
+
+
+def build_ticket_analysis(rows):
+    """Match the roadmap's ticket numbers (Custom.Ticketnumber — the
+    lowest-level PBI value overrides the Feature value, empty story
+    inherits the Feature's value) against the ticket system export.
+
+    Only tracked tickets are analyzed (Request Type in
+    TICKET_REQUEST_TYPES and Status in TICKET_ALLOWED_STATUS_KEYWORDS).
+
+    Returns a dict with the export path, per-ticket covered flags,
+    per-severity and per-module stats and tickets referenced by the
+    roadmap but missing from the export — or None if the export is
+    unavailable."""
+    export_path = find_latest_ticket_export()
+    if not export_path:
+        print("      No ticket export found — ticket analysis skipped")
+        return None
+    print(f"      Ticket export: {os.path.basename(export_path)}")
+
+    tickets = load_ticket_export(export_path)
+    if tickets is None:
+        print("      WARNING: ticket export has no recognizable sheet — analysis skipped")
+        return None
+
+    # Filter to tracked tickets only (CR + Committed/Open/New)
+    tracked = [t for t in tickets if is_tracked_ticket(t)]
+    excluded = len(tickets) - len(tracked)
+    if excluded:
+        print(f"      {excluded} tickets excluded (Request Type not in "
+              f"{TICKET_REQUEST_TYPES} or status not Committed/Open/New)")
+    if not tracked:
+        print("      WARNING: no tracked tickets in the export — analysis skipped")
+        return None
+
+    # Ticket numbers covered by the roadmap = numbers referenced by any
+    # roadmap row's resolved Ticket Number (story override / feature inherit)
+    covered_set = set()
+    for r in rows:
+        for num in parse_ticket_numbers(r.get("Ticket Number", "")):
+            covered_set.add(num)
+
+    per_severity = {}
+    per_module = {}
+    covered_total = 0
+    for t in tracked:
+        t["covered"] = t["number"] in covered_set
+        if t["covered"]:
+            covered_total += 1
+
+        sev = t.get("severity") or "Unknown"
+        stats = per_severity.setdefault(sev, {"total": 0, "covered": 0})
+        stats["total"] += 1
+        if t["covered"]:
+            stats["covered"] += 1
+
+        mod = t.get("module") or "Unknown"
+        stats = per_module.setdefault(mod, {"total": 0, "covered": 0})
+        stats["total"] += 1
+        if t["covered"]:
+            stats["covered"] += 1
+
+    export_ids = {t["number"] for t in tickets}
+    missing_from_export = sorted(covered_set - export_ids, key=ticket_number_sort_key)
+
+    print(f"      {len(tracked)} tracked tickets — covered: {covered_total}, "
+          f"not covered: {len(tracked) - covered_total}")
+    if missing_from_export:
+        print(f"      {len(missing_from_export)} ticket numbers referenced in the roadmap are not in the export")
+
+    return {
+        "export_path": export_path,
+        "tickets": tracked,
+        "tracked_total": len(tracked),
+        "excluded_total": excluded,
+        "per_severity": per_severity,
+        "per_module": per_module,
+        "total": len(tracked),
+        "covered_total": covered_total,
+        "not_covered_total": len(tracked) - covered_total,
+        "missing_from_export": missing_from_export,
+        "roadmap_ticket_count": len(covered_set),
+    }
+
+
+# ============================================================
 # EXCEL GENERATION
 # ============================================================
 
@@ -730,10 +1004,14 @@ def generate_excel(rows):
 
     wb = Workbook()
 
+    # --- TICKET SYSTEM ANALYSIS (before sheets are built) ---
+    print("\n      Ticket system analysis...")
+    ticket_data = build_ticket_analysis(rows)
+
     # --- DASHBOARD SHEET (created first = opens first) ---
     dash_ws = wb.active
     dash_ws.title = "Dashboard"
-    build_dashboard(dash_ws, rows, feature_status, new_data)
+    build_dashboard(dash_ws, rows, feature_status, new_data, ticket_data)
 
     # --- ROADMAP SHEET ---
     ws = wb.create_sheet("Roadmap", 1)
@@ -852,6 +1130,9 @@ def generate_excel(rows):
     # --- NEW STORIES SHEET (filterable detail table) ---
     build_new_stories_sheet(wb, new_detail_rows)
 
+    # --- TICKETS SHEET (ticket system analysis detail table) ---
+    build_tickets_sheet(wb, ticket_data)
+
     # --- SUMMARY SHEET ---
     summary_ws = wb.create_sheet("Summary")
     summary_ws.sheet_properties.tabColor = "808080"
@@ -921,11 +1202,12 @@ def generate_excel(rows):
 # DASHBOARD
 # ============================================================
 
-def build_dashboard(dash_ws, rows, feature_status, new_data):
+def build_dashboard(dash_ws, rows, feature_status, new_data, ticket_data=None):
     """Professional dashboard: overall + per-project status breakdown
     (all tables reconcile with each other), and new items broken down
     by project & owner. The filterable detail list lives on the
-    'New Stories' sheet."""
+    'New Stories' sheet. Ticket system analysis (per-severity counts +
+    covered/not covered) is added as the last section when available."""
 
     # --- Column widths ---
     widths = {"A": 30, "B": 26, "C": 14, "D": 14, "E": 14, "F": 14, "G": 24}
@@ -1150,6 +1432,91 @@ def build_dashboard(dash_ws, rows, feature_status, new_data):
         c = dash_ws.cell(row=row, column=1, value=f"No stories completed after {CUTOFF_DATE}")
         c.font = Font(name="Segoe UI", size=10, italic=True, color="999999")
 
+    # --- Section 5: Ticket System Analysis (work in progress) ---
+    row += 2
+    row = write_section(row, "Ticket System Analysis (Work in Progress)", 4)
+
+    if ticket_data:
+        row = write_table_header(row, ["Severity", "Tickets", "Covered by Roadmap", "Not Covered"])
+
+        sevs = sorted(ticket_data["per_severity"].keys(), key=severity_sort_key)
+        for sev in sevs:
+            s = ticket_data["per_severity"][sev]
+            row = write_data_row(row, [sev, s["total"], s["covered"], s["total"] - s["covered"]])
+
+        row = write_data_row(
+            row,
+            ["Total", ticket_data["total"], ticket_data["covered_total"],
+             ticket_data["not_covered_total"]],
+            total=True,
+        )
+
+        # Tickets per module (under the severity table)
+        row += 1
+        c = dash_ws.cell(row=row, column=1, value="Tickets per Module")
+        c.font = Font(name="Segoe UI", bold=True, size=10, color="1F3864")
+        row += 1
+        row = write_table_header(row, ["Module", "Tickets", "Covered by Roadmap", "Not Covered"])
+
+        per_module = ticket_data.get("per_module") or {}
+        modules = sorted(per_module.keys(), key=lambda m: (-per_module[m]["total"], m.lower()))
+        for mod in modules:
+            m = per_module[mod]
+            row = write_data_row(row, [mod, m["total"], m["covered"], m["total"] - m["covered"]])
+
+        row = write_data_row(
+            row,
+            ["Total", ticket_data["total"], ticket_data["covered_total"],
+             ticket_data["not_covered_total"]],
+            total=True,
+        )
+
+        # Work-in-progress disclaimer
+        row += 1
+        c = dash_ws.cell(
+            row=row, column=1,
+            value=("Note: the ticket system analysis is still a work in progress — only the "
+                   "number of covered tickets is accurate. Tickets shown as 'Not Covered' may "
+                   "still be covered but are not yet linked to a PBI or Feature in Azure DevOps."),
+        )
+        c.font = Font(name="Segoe UI", size=9, italic=True, color="C00000")
+        dash_ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
+
+        # Ticket numbers referenced by the roadmap but missing from the export
+        missing = ticket_data.get("missing_from_export") or []
+        if missing:
+            row += 1
+            shown = ", ".join(missing[:TICKET_MISSING_LIST_MAX])
+            if len(missing) > TICKET_MISSING_LIST_MAX:
+                shown += ", ..."
+            c = dash_ws.cell(
+                row=row, column=1,
+                value=(f"Ticket numbers linked to roadmap items but not found in the ticket "
+                       f"export (likely resolved or inactive tickets): {shown}"),
+            )
+            c.font = Font(name="Segoe UI", size=9, italic=True, color="808080")
+            dash_ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
+
+        # Pointer to the detail sheet
+        row += 1
+        c = dash_ws.cell(
+            row=row, column=1,
+            value=(f"Full ticket list: see the 'Tickets' sheet "
+                   f"(source: {os.path.basename(ticket_data['export_path'])})"),
+        )
+        c.font = Font(name="Segoe UI", size=9, italic=True, color="808080")
+        dash_ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
+    else:
+        row += 1
+        c = dash_ws.cell(
+            row=row, column=1,
+            value=(f"Ticket analysis skipped — no export found (pattern '{TICKET_EXPORT_PATTERN}' in "
+                   f"'{TICKET_EXPORT_FOLDER}') or no tracked tickets "
+                   f"(Request Type '{'/'.join(TICKET_REQUEST_TYPES)}' with status Committed / Open (New))."),
+        )
+        c.font = Font(name="Segoe UI", size=10, italic=True, color="999999")
+        dash_ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
+
     dash_ws.freeze_panes = "A4"
 
 
@@ -1223,6 +1590,132 @@ def build_new_stories_sheet(wb, detail_rows):
         c.font = Font(name="Segoe UI", size=10, italic=True, color="999999")
 
 
+def build_tickets_sheet(wb, ticket_data):
+    """Dedicated 'Tickets' sheet: every ticket from the ticket system
+    export with name, severity, number, status and a 'Covered by
+    Roadmap' flag — as a real Excel Table (filter dropdowns + banded
+    rows). Sorted by severity, then not-covered first, then ticket
+    number. Skipped gracefully when the export is unavailable."""
+    ws = wb.create_sheet("Tickets", 3)
+    ws.sheet_properties.tabColor = "C55A11"
+
+    headers = ["Ticket Name", "Severity", "Ticket Number", "Status", "Covered by Roadmap"]
+    widths = [60, 16, 16, 16, 20]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    thin_b = Border(
+        left=Side(style="thin", color="D6D6D6"),
+        right=Side(style="thin", color="D6D6D6"),
+        top=Side(style="thin", color="D6D6D6"),
+        bottom=Side(style="thin", color="D6D6D6"),
+    )
+    title_font = Font(name="Segoe UI", bold=True, size=14, color="1F3864")
+    note_font = Font(name="Segoe UI", size=9, italic=True, color="C00000")
+    meta_font = Font(name="Segoe UI", size=9, color="808080")
+    hdr_font = Font(name="Segoe UI", bold=True, size=10, color="FFFFFF")
+    hdr_fill = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")
+    hdr_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    covered_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    covered_font = Font(name="Segoe UI", size=10, color="006100")
+    not_covered_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    not_covered_font = Font(name="Segoe UI", size=10, color="9C0006")
+
+    # Title + WIP note
+    if ticket_data:
+        c = ws.cell(row=1, column=1,
+                    value=f"Ticket System Analysis — {os.path.basename(ticket_data['export_path'])}")
+        c.font = title_font
+        ws.merge_cells("A1:E1")
+
+        c = ws.cell(row=2, column=1,
+                    value=("Work in progress: only the number of covered tickets is accurate — "
+                           "tickets marked as 'No' may still be covered but are not yet linked "
+                           "to a PBI or Feature in Azure DevOps."))
+        c.font = note_font
+        ws.merge_cells("A2:E2")
+
+        excluded = ticket_data.get("excluded_total", 0)
+        filter_note = (f"Tracking Request Type '{'/'.join(TICKET_REQUEST_TYPES)}' with status "
+                       f"Committed / Open (New) only")
+        if excluded:
+            filter_note += f" — {excluded} tickets of other types/statuses excluded"
+        c = ws.cell(row=3, column=1, value=filter_note)
+        c.font = meta_font
+        ws.merge_cells("A3:E3")
+
+        header_row = 4
+    else:
+        c = ws.cell(row=1, column=1, value="Ticket System Analysis")
+        c.font = title_font
+        ws.merge_cells("A1:E1")
+
+        c = ws.cell(row=2, column=1,
+                    value=(f"No ticket export found (pattern '{TICKET_EXPORT_PATTERN}' in "
+                           f"'{TICKET_EXPORT_FOLDER}') — ticket analysis skipped."))
+        c.font = meta_font
+        ws.merge_cells("A2:E2")
+
+        header_row = 4
+
+    if ticket_data and ticket_data["tickets"]:
+        for col_idx, h in enumerate(headers, 1):
+            c = ws.cell(row=header_row, column=col_idx, value=h)
+            c.font = hdr_font
+            c.fill = hdr_fill
+            c.alignment = hdr_align
+            c.border = thin_b
+
+        data_font = Font(name="Segoe UI", size=10)
+        data_align = Alignment(vertical="top", wrap_text=True)
+
+        # Sort: severity order, not-covered first, then ticket number
+        tickets = sorted(
+            ticket_data["tickets"],
+            key=lambda t: (
+                severity_sort_key(t.get("severity")),
+                0 if not t.get("covered") else 1,
+                ticket_number_sort_key(t.get("number")),
+            ),
+        )
+
+        r = header_row + 1
+        for t in tickets:
+            covered = t.get("covered")
+            vals = [t.get("name", ""), t.get("severity", ""), t.get("number", ""),
+                    t.get("status", ""), "Yes" if covered else "No"]
+            for col_idx, val in enumerate(vals, 1):
+                c = ws.cell(row=r, column=col_idx, value=val)
+                c.border = thin_b
+                if col_idx == 5:
+                    c.font = covered_font if covered else not_covered_font
+                    c.fill = covered_fill if covered else not_covered_fill
+                    c.alignment = Alignment(horizontal="center", vertical="center")
+                else:
+                    c.font = data_font
+                    c.alignment = data_align
+            r += 1
+        last_row = r - 1
+
+        # Real Excel Table -> filter dropdowns + banded styling
+        tab = Table(displayName="TicketsTable", ref=f"A{header_row}:E{last_row}")
+        tab.tableColumns = [TableColumn(id=i + 1, name=h) for i, h in enumerate(headers)]
+        tab.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2",
+            showRowStripes=True,
+            showColumnStripes=False,
+            showFirstColumn=False,
+            showLastColumn=False,
+        )
+        ws.add_table(tab)
+        ws.freeze_panes = f"A{header_row + 1}"
+    elif ticket_data:
+        c = ws.cell(row=header_row, column=1,
+                    value="No tracked tickets in the export "
+                          f"(Request Type '{'/'.join(TICKET_REQUEST_TYPES)}' with status Committed / Open (New))")
+        c.font = Font(name="Segoe UI", size=10, italic=True, color="999999")
+
+
 # ============================================================
 # DATE WIZARD
 # ============================================================
@@ -1267,8 +1760,16 @@ def prompt_cutoff_dates():
 # ============================================================
 
 def main():
+    # UTF-8 console (ticket severities come with emoji prefixes from the export)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream and hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     print("=" * 60)
-    print("  ADO Roadmap Sync v6")
+    print("  ADO Roadmap Sync v7")
     print("  TFS: " + TFS_URL)
     print(f"  Projects: {', '.join(PROJECTS)}")
     print("=" * 60)

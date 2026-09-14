@@ -1,4 +1,4 @@
-# ADO Roadmap Sync v6
+# ADO Roadmap Sync v7
 
 Builds `roadmap_<date>_<time>.xlsx` from scratch on every run: pulls **Product Backlog Items + Product Non Backlog Items + orphan Features/Epics** from 4 TFS projects and generates a local Excel roadmap with a **Dashboard**. Nothing is carried over between runs — TFS is the single source of truth.
 
@@ -109,6 +109,31 @@ Owner resolution for stories: own assignee → parent Feature assignee → grand
 2. **Status Breakdown by Project** — reconciles with table 1
 3. **New Items After CUTOFF — by Project & Owner** (+ filterable "New Stories" sheet)
 4. **Completed After CUTOFF — by Project & Owner** (+ full list below)
+5. **Ticket System Analysis (Work in Progress)** — tickets per severity + covered / not covered, a breakdown per module, and a note that only the covered count is accurate (tickets marked "Not Covered" may still be covered but not yet linked to a PBI or Feature in Azure DevOps)
+
+## Ticket system analysis (v7+)
+
+The script reads the **ticket system export Excel** (e.g. `Active All Requests 9-14-2026 6-45-25 PM.xlsx`) — it must be placed **in the same folder as the script**. The **newest** file matching `Active All Requests*` is used automatically, so simply export a new file and drop it in the folder (older ones are ignored).
+
+**Only tracked tickets are analyzed:** Request Type `CR` **and** Status `Committed` or `Open`/`New` (emoji prefixes are ignored). Other request types (BUG, Data Management, New Feature, …) and statuses (On hold, Resolved, Cancelled, Closed, Rejected, …) are excluded.
+
+**Covered by Roadmap** = the ticket number appears in the *Ticket Number* of at least one roadmap row. The resolved *Ticket Number* follows the same override rule as the roadmap column: the lowest-level PBI's value overrides the Feature's value; a PBI with no value inherits the Feature's value. Only tickets linked to items that are actually **in the roadmap** count (owner filter + roadmap cutoff apply).
+
+The new **Tickets** sheet lists every ticket from the export:
+
+| Column | Source |
+|--------|--------|
+| Ticket Name | export: Subject |
+| Severity | export: Priority (🟥Critical / 🟦High / 🟨Medium / 🟩Normal) |
+| Ticket Number | export: ID |
+| Status | export: Status (🚩Open / Committed) |
+| Covered by Roadmap | Yes (green) / No (red) — matched against roadmap Ticket Numbers |
+
+Sorted by severity, then not-covered first, then ticket number. It is a real Excel table — use the filter dropdowns.
+
+The Dashboard section shows two tables: **tickets per severity** and, right under it, **tickets per module** (the export's *Subcategory* column) — each with total / covered / not covered. It also lists ticket numbers that are linked to roadmap items but **missing from the ticket export** (likely resolved/inactive tickets).
+
+To disable ticket analysis set `TICKET_EXPORT_FOLDER = ""`. To use a specific export file, set `TICKET_EXPORT_FOLDER` to the full file path instead of a folder.
 
 ## Output columns (16)
 
@@ -133,10 +158,11 @@ Owner resolution for stories: own assignee → parent Feature assignee → grand
 
 ## Sheets
 
-1. **Dashboard** — status breakdown, new items, completed items
+1. **Dashboard** — status breakdown, new items, completed items, ticket analysis
 2. **Roadmap** — main data with merged feature cells, color-coded status
 3. **New Stories** — filterable Excel table of items created after CUTOFF_DATE
-4. **Summary** — counts by status, owner, module
+4. **Tickets** — ticket system analysis: every ticket with covered-by-roadmap flag
+5. **Summary** — counts by status, owner, module
 
 ## Configuration
 
@@ -149,6 +175,10 @@ PROJECTS = [...]                   # 4 projects to sync
 ALLOWED_OWNERS = [...]              # 8 owner name patterns
 CUTOFF_DATE = "2026-09-01"          # Default: new-items threshold (wizard question 2)
 ROADMAP_CUTOFF_DATE = "2026-08-01"  # Default: roadmap start date (wizard question 1)
+TICKET_EXPORT_FOLDER = OUTPUT_FOLDER  # Folder (or full file path) of the ticket export — script folder by default
+TICKET_EXPORT_PATTERN = "Active All Requests*"
+TICKET_REQUEST_TYPES = ["CR"]       # Only these request types are tracked
+TICKET_ALLOWED_STATUS_KEYWORDS = ["committed", "open", "new"]  # Statuses tracked
 ```
 
 ## Troubleshooting
@@ -159,4 +189,5 @@ ROADMAP_CUTOFF_DATE = "2026-08-01"  # Default: roadmap start date (wizard questi
 | 401 Authentication failed | PAT expired or wrong scope |
 | No work items found | Check work item type / owner filters |
 | Ticket/Category columns empty | Populate Custom.Ticketnumber etc. on the Features/stories in TFS — the team fills these |
+| Ticket analysis skipped | No `Active All Requests*` file in the script folder — export it from the ticket system and drop it next to the script |
 | Folder filling with old files | Every run creates a new `roadmap_<date>_<time>.xlsx` — delete old ones you no longer need |
