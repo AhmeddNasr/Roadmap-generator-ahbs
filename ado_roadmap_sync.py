@@ -45,6 +45,8 @@ import fnmatch
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from collections import defaultdict
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -99,6 +101,11 @@ NEW_FIELD_REFS = {
 }
 # Some of these fields are HTML-formatted in TFS and need cleaning
 HTML_NEW_FIELDS = {"Custom.Ticketnumber", "Custom.BusinessImpactValue"}
+
+# Standard Weight (note: the field is spelled 'Standared weight' in TFS).
+# Falls back to the item's Effort when Standard Weight is empty.
+STANDARD_WEIGHT_REF = "Custom.Standaredweight"
+EFFORT_REF = "Microsoft.VSTS.Scheduling.Effort"
 
 # Cutoff date for dashboard "new items" counting
 CUTOFF_DATE = "2026-09-01"
@@ -181,6 +188,17 @@ def get_auth_header():
     return {"Authorization": f"Basic {encoded}", "Content-Type": "application/json"}
 
 
+# Shared HTTP session with keep-alive + automatic retries. Transient DNS
+# failures ('Failed to resolve' / getaddrinfo errors, common when several
+# batches resolve at once) and blips are retried with backoff instead of
+# falling through to the per-item path.
+_HTTP = requests.Session()
+_RETRY = Retry(total=3, connect=3, read=3, backoff_factor=0.5,
+               status_forcelist=(502, 503, 504))
+_HTTP.mount("http://", HTTPAdapter(max_retries=_RETRY))
+_HTTP.mount("https://", HTTPAdapter(max_retries=_RETRY))
+
+
 # ============================================================
 # TFS API
 # ============================================================
@@ -188,7 +206,7 @@ def get_auth_header():
 def run_wiql(query, top=5000):
     url = f"{TFS_URL}/_apis/wit/wiql?api-version={API_VERSION}"
     payload = {"query": query, "top": top}
-    resp = requests.post(url, json=payload, headers=get_auth_header(), timeout=60)
+    resp = _HTTP.post(url, json=payload, headers=get_auth_header(), timeout=60)
     resp.raise_for_status()
     return resp.json().get("workItems", [])
 
@@ -208,7 +226,7 @@ def fetch_work_items_with_relations(ids):
             f"?ids={ids_param}&$expand=relations&api-version={API_VERSION}"
         )
         try:
-            resp = requests.get(url, headers=get_auth_header(), timeout=120)
+            resp = _HTTP.get(url, headers=get_auth_header(), timeout=120)
             if resp.status_code == 404:
                 return []
             resp.raise_for_status()
@@ -220,7 +238,7 @@ def fetch_work_items_with_relations(ids):
             for wid in batch:
                 try:
                     url2 = f"{TFS_URL}/_apis/wit/workItems/{wid}?$expand=relations&api-version={API_VERSION}"
-                    r2 = requests.get(url2, headers=get_auth_header(), timeout=30)
+                    r2 = _HTTP.get(url2, headers=get_auth_header(), timeout=30)
                     if r2.status_code == 200:
                         out.append(r2.json())
                 except Exception:
@@ -249,7 +267,7 @@ def fetch_work_items_basic(ids):
             f"?ids={ids_param}&api-version={API_VERSION}"
         )
         try:
-            resp = requests.get(url, headers=get_auth_header(), timeout=120)
+            resp = _HTTP.get(url, headers=get_auth_header(), timeout=120)
             if resp.status_code == 404:
                 return []
             resp.raise_for_status()
@@ -335,6 +353,25 @@ def format_date(date_string):
         return dt.strftime("%Y-%m-%d")
     except:
         return date_string
+
+
+def to_number(value):
+    """Coerce a cell value to float for weight sums (None when not numeric)."""
+    if value in ("", None):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_standard_weight(fields):
+    """Standard Weight — falls back to the item's Effort when the
+    Standard Weight field is empty; empty string when neither is set."""
+    std_weight = fields.get(STANDARD_WEIGHT_REF)
+    if std_weight in (None, ""):
+        std_weight = fields.get(EFFORT_REF)
+    return std_weight if std_weight not in (None, "") else ""
 
 
 def parse_date_for_cutoff(date_string):
@@ -610,12 +647,13 @@ def map_pbi_to_row(wi, parent_lookup, grandparent_lookup):
         "Business Area / Feature": feature,
         "Requirement": requirement,
         "Azure ID": ref_id,
+        "Standard Weight": resolve_standard_weight(fields),
         "Ticket Number": new_vals.get("Ticket Number", ""),
         "Impact": new_vals.get("Impact", ""),
         "Status": status,
         "Added on": added_on,
         "Start Date": start_date,
-        "Delivery Date": delivery_date,
+        "Done Date": delivery_date,
         "Category": new_vals.get("Category", ""),
         "Notes": new_vals.get("Notes", ""),
         "_id": sync_id,
@@ -663,12 +701,13 @@ def map_orphan_to_row(wi, parent_lookup, grandparent_lookup):
         "Business Area / Feature": business_area,
         "Requirement": title,
         "Azure ID": "",
+        "Standard Weight": resolve_standard_weight(fields),
         "Ticket Number": new_vals.get("Ticket Number", ""),
         "Impact": new_vals.get("Impact", ""),
         "Status": "Backlog",
         "Added on": format_date(created_date),
         "Start Date": "",
-        "Delivery Date": "",
+        "Done Date": "",
         "Category": new_vals.get("Category", ""),
         "Notes": new_vals.get("Notes", ""),
         "_id": str(wi.get("id", "")),
@@ -1039,7 +1078,7 @@ def generate_excel(rows):
     for r in rows:
         if r.get("Status") != "Done" or r.get("_item_type") != "story":
             continue
-        delivery = r.get("Delivery Date", "")
+        delivery = r.get("Done Date", "")
         delivery_dt = parse_date_for_cutoff(delivery + "T00:00:00+00:00") if delivery else None
         if not (delivery_dt and cutoff_dt and delivery_dt > cutoff_dt):
             continue
@@ -1052,6 +1091,7 @@ def generate_excel(rows):
             "Feature": r.get("Business Area / Feature", ""),
             "Story Title": r.get("Requirement", ""),
             "Story ID": r.get("Azure ID", ""),
+            "Standard Weight": r.get("Standard Weight", ""),
             "Ticket Number": r.get("Ticket Number", ""),
             "Done Date": delivery,
             "_id": r.get("_id", ""),
@@ -1125,13 +1165,14 @@ def generate_excel(rows):
         ("Business Area / Feature", 40),
         ("Requirement", 50),
         ("Azure ID", 12),
+        ("Standard Weight", 14),
         ("Ticket Number", 14),
         ("Ticket Priority", 14),
         ("Impact", 12),
         ("Status", 14),
         ("Added on", 14),
         ("Start Date", 14),
-        ("Delivery Date", 14),
+        ("Done Date", 14),
         ("Category", 18),
         ("Notes", 35),
     ]
@@ -1149,11 +1190,11 @@ def generate_excel(rows):
     data_font = Font(name="Segoe UI", size=10)
     link_font = Font(name="Segoe UI", size=10, color="0563C1", underline="single")
     data_align = Alignment(vertical="top", wrap_text=True)
+    weight_align = Alignment(vertical="top", horizontal="left")
     feature_font = Font(name="Segoe UI", size=10, bold=True)
     feature_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
 
-    # Feature group fully done = green on the feature column only
-    done_feature_fill = PatternFill(start_color="C6E0B4", end_color="C6E0B4", fill_type="solid")
+    # Feature group fully done = Done status green (feature column only)
 
     status_colors = {
         "Backlog": PatternFill(start_color="E3F2FD", end_color="E3F2FD", fill_type="solid"),
@@ -1178,6 +1219,7 @@ def generate_excel(rows):
     col_names = [c[0] for c in columns]
     feature_col_idx = col_names.index("Business Area / Feature") + 1
     status_col_idx = col_names.index("Status") + 1
+    weight_col_idx = col_names.index("Standard Weight") + 1
     num_cols = len(columns)
 
     for row_idx, row_data in enumerate(rows, 2):
@@ -1189,12 +1231,9 @@ def generate_excel(rows):
 
         for col_idx, (col_name, _) in enumerate(columns, 1):
             value = row_data.get(col_name, "")
-            # Long dash for empty fields
-            if value is None or (isinstance(value, str) and not value.strip()):
-                value = "—"
             cell = ws.cell(row=row_idx, column=col_idx, value=value)
             cell.font = data_font
-            cell.alignment = data_align
+            cell.alignment = weight_align if col_idx == weight_col_idx else data_align
             cell.border = thin_border
 
             # Azure ID links straight to the work item in TFS
@@ -1213,7 +1252,7 @@ def generate_excel(rows):
             # Determine fill
             if col_idx == feature_col_idx:
                 cell.font = feature_font
-                cell.fill = done_feature_fill if is_done_group else feature_fill
+                cell.fill = status_colors["Done"] if is_done_group else feature_fill
             elif status_fill and col_idx == status_col_idx:
                 cell.fill = status_fill
 
@@ -1254,6 +1293,9 @@ def generate_excel(rows):
     summary_ws.sheet_properties.tabColor = "808080"
     summary_ws.column_dimensions["A"].width = 30
     summary_ws.column_dimensions["B"].width = 15
+    summary_ws.column_dimensions["C"].width = 15
+    summary_ws.column_dimensions["D"].width = 15
+    summary_ws.column_dimensions["E"].width = 15
     summary_font = Font(name="Segoe UI", bold=True, size=14, color="2F5496")
     summary_ws.cell(row=1, column=1, value="Sync Summary").font = summary_font
 
@@ -1263,9 +1305,6 @@ def generate_excel(rows):
     owner_counts = defaultdict(int)
     for r in rows:
         owner_counts[r.get("Owner", "Unassigned")] += 1
-    module_counts = defaultdict(int)
-    for r in rows:
-        module_counts[r.get("Module", "Unknown")] += 1
 
     summary_data = [
         ("", ""),
@@ -1284,16 +1323,43 @@ def generate_excel(rows):
     summary_data.append(("--- By Owner ---", ""))
     for o, c in sorted(owner_counts.items(), key=lambda x: -x[1]):
         summary_data.append((o, c))
-    summary_data.append(("", ""))
-    summary_data.append(("--- By Module ---", ""))
-    for m, c in sorted(module_counts.items(), key=lambda x: -x[1]):
-        summary_data.append((m, c))
 
-    for row_idx, (label, value) in enumerate(summary_data, 3):
-        c1 = summary_ws.cell(row=row_idx, column=1, value=label)
-        c1.font = Font(name="Segoe UI", bold=True, size=11)
-        c2 = summary_ws.cell(row=row_idx, column=2, value=value)
-        c2.font = Font(name="Segoe UI", size=11)
+    # --- Standard Weight by Owner (Done / Development / Testing) ---
+    summary_data.append(("", ""))
+    summary_data.append(("--- Standard Weight by Owner ---", "", "", ""))
+    summary_data.append(("Owner", "Done", "Development", "Testing", "Total"))
+
+    weight_by_owner = defaultdict(lambda: {"Done": 0.0, "Development": 0.0, "Testing": 0.0})
+    for r in rows:
+        w = to_number(r.get("Standard Weight"))
+        if w is None:
+            continue
+        st = r.get("Status")
+        if st in ("Done", "Development", "Testing"):
+            weight_by_owner[r.get("Owner") or "Unassigned"][st] += w
+
+    def fmt_weight(v):
+        return int(v) if float(v).is_integer() else round(float(v), 1)
+
+    weight_total = {"Done": 0.0, "Development": 0.0, "Testing": 0.0}
+    for owner in sorted(weight_by_owner):
+        sums = weight_by_owner[owner]
+        for k in weight_total:
+            weight_total[k] += sums[k]
+        summary_data.append((owner, fmt_weight(sums["Done"]),
+                             fmt_weight(sums["Development"]),
+                             fmt_weight(sums["Testing"]),
+                             fmt_weight(sums["Done"] + sums["Development"] + sums["Testing"])))
+    summary_data.append(("Total", fmt_weight(weight_total["Done"]),
+                         fmt_weight(weight_total["Development"]),
+                         fmt_weight(weight_total["Testing"]),
+                         fmt_weight(weight_total["Done"] + weight_total["Development"]
+                                    + weight_total["Testing"])))
+
+    for row_idx, vals in enumerate(summary_data, 3):
+        for col_idx, val in enumerate(vals, 1):
+            c = summary_ws.cell(row=row_idx, column=col_idx, value=val)
+            c.font = Font(name="Segoe UI", bold=(col_idx == 1), size=11)
 
     # Output file name includes the generation date & time
     output_path = os.path.join(
@@ -1518,7 +1584,7 @@ def build_dashboard(dash_ws, rows, feature_status, new_data, ticket_data=None):
 
     # --- Section 4: Completed After Cutoff (counts by project & owner) ---
     row += 2
-    row = write_section(row, f"Completed After {CUTOFF_DATE} — Stories Set as Done", 4)
+    row = write_section(row, f"Completed After {CUTOFF_DATE} — Stories Set as Done", 3)
     row = write_table_header(row, ["Project", "Owner", "Completed Stories"])
 
     completed_counts = new_data.get("completed_counts", {})
@@ -1714,8 +1780,8 @@ def build_completed_stories_sheet(wb, detail_rows):
     ws.sheet_properties.tabColor = "548235"
 
     headers = ["Owner", "Project", "Module", "Feature", "Story Title", "Story ID",
-               "Ticket Number", "Ticket Priority", "Done Date"]
-    widths = [30, 20, 20, 42, 55, 12, 14, 14, 13]
+               "Standard Weight", "Ticket Number", "Ticket Priority", "Done Date"]
+    widths = [30, 20, 20, 42, 55, 12, 14, 14, 14, 13]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -1734,12 +1800,12 @@ def build_completed_stories_sheet(wb, detail_rows):
     c = ws.cell(row=1, column=1,
                 value="List of user stories delivered to the PO since the cut off")
     c.font = title_font
-    ws.merge_cells("A1:I1")
+    ws.merge_cells("A1:J1")
 
     c = ws.cell(row=2, column=1,
                 value=f"Stories set as Done after {CUTOFF_DATE}  |  {len(detail_rows)} user stories")
     c.font = meta_font
-    ws.merge_cells("A2:I2")
+    ws.merge_cells("A2:J2")
 
     header_row = 4
 
@@ -1753,26 +1819,27 @@ def build_completed_stories_sheet(wb, detail_rows):
 
         data_font = Font(name="Segoe UI", size=10)
         link_font = Font(name="Segoe UI", size=10, color="0563C1", underline="single")
+        weight_align = Alignment(vertical="top", horizontal="left")
         data_align = Alignment(vertical="top", wrap_text=True)
 
         r = header_row + 1
         for d in detail_rows:
             vals = [d["Owner"], d["Project"], d["Module"], d["Feature"],
-                    d["Story Title"], d["Story ID"], d["Ticket Number"],
-                    d["Ticket Priority"], d["Done Date"]]
+                    d["Story Title"], d["Story ID"], d["Standard Weight"],
+                    d["Ticket Number"], d["Ticket Priority"], d["Done Date"]]
             for col_idx, val in enumerate(vals, 1):
                 c = ws.cell(row=r, column=col_idx, value=val)
                 c.font = data_font
-                c.alignment = data_align
+                c.alignment = weight_align if col_idx == 7 else data_align
                 c.border = thin_b
-                if col_idx == 7 and d.get("Ticket URL"):
+                if col_idx == 8 and d.get("Ticket URL"):
                     c.hyperlink = d["Ticket URL"]
                     c.font = link_font
             r += 1
         last_row = r - 1
 
         # Real Excel Table -> filter dropdowns + banded styling
-        table_ref = f"A{header_row}:I{last_row}"
+        table_ref = f"A{header_row}:J{last_row}"
         tab = Table(displayName="CompletedStoriesTable", ref=table_ref,
                     autoFilter=AutoFilter(ref=table_ref))
         tab.tableColumns = [TableColumn(id=i + 1, name=h) for i, h in enumerate(headers)]
@@ -2046,8 +2113,8 @@ def main():
                 continue
 
             # Exclude stories done before roadmap cutoff
-            if row["Status"] == "Done" and row["Delivery Date"]:
-                delivery_dt = parse_date_for_cutoff(row["Delivery Date"] + "T00:00:00+00:00")
+            if row["Status"] == "Done" and row["Done Date"]:
+                delivery_dt = parse_date_for_cutoff(row["Done Date"] + "T00:00:00+00:00")
                 if delivery_dt and roadmap_cutoff_dt and delivery_dt < roadmap_cutoff_dt:
                     skipped_done_before_cutoff += 1
                     continue
@@ -2072,6 +2139,8 @@ def main():
         for col in NEW_FIELD_REFS:
             n = sum(1 for r in all_rows if str(r.get(col, "") or "").strip())
             print(f"      '{col}' populated on {n} rows")
+        n_sw = sum(1 for r in all_rows if str(r.get("Standard Weight", "") or "").strip())
+        print(f"      'Standard Weight' populated on {n_sw} rows")
         print(f"      [4/5] took {time.time() - t0:.1f}s")
 
         if not all_rows:
