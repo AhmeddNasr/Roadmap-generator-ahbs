@@ -132,7 +132,17 @@ TICKET_EXPORT_COLUMNS = {
     "status": ["Status"],
     "request_type": ["Request Type", "Type"],
     "module": ["Subcategory", "Module"],
+    # Dynamics record GUID — used to build the ticket deep link
+    "guid": ["(Do Not Modify) All Requests ID", "All Requests ID"],
 }
+
+# Deep link into Dynamics 365 for a ticket record ('{guid}' is replaced
+# with the ticket's '(Do Not Modify) All Requests ID' value)
+TICKET_URL_TEMPLATE = (
+    "https://org2f45e702.crm4.dynamics.com/main.aspx"
+    "?appid=1176d8e9-1da0-ef11-8a6a-6045bd94a6e7"
+    "&forceUCI=1&pagetype=entityrecord&etn=cr603_allrequests&id={guid}"
+)
 
 # Only tickets matching these are tracked in the analysis:
 # - Request Type must be one of TICKET_REQUEST_TYPES (exact, case-insensitive)
@@ -841,6 +851,7 @@ def load_ticket_export(path):
                         "status": str(get(row, "status") or "") or "Unknown",
                         "request_type": str(get(row, "request_type") or "").strip(),
                         "module": str(get(row, "module") or "").strip() or "Unknown",
+                        "guid": str(get(row, "guid") or "").strip(),
                     })
                 return tickets
         return None
@@ -895,9 +906,12 @@ def build_ticket_analysis(rows):
     # export (not just tracked ones) so that resolved/inactive tickets
     # referenced by the roadmap still resolve to their priority
     number_to_priority = {}
+    number_to_guid = {}
     for t in tickets:
         if t["number"] not in number_to_priority:
             number_to_priority[t["number"]] = t.get("severity") or ""
+        if t["number"] not in number_to_guid and t.get("guid"):
+            number_to_guid[t["number"]] = t["guid"]
 
     if excluded:
         print(f"      {excluded} tickets excluded (Request Type not in "
@@ -954,6 +968,7 @@ def build_ticket_analysis(rows):
         "missing_from_export": missing_from_export,
         "roadmap_ticket_count": len(covered_set),
         "number_to_priority": number_to_priority,
+        "number_to_guid": number_to_guid,
     }
 
 
@@ -1079,6 +1094,21 @@ def generate_excel(rows):
             d.get("Ticket Number", ""), ticket_priority_lookup
         )
 
+    # Ticket deep links into Dynamics — first ticket listed in the cell
+    number_to_guid = (ticket_data or {}).get("number_to_guid", {})
+
+    def first_ticket_url(ticket_number_value):
+        nums = parse_ticket_numbers(ticket_number_value)
+        guid = number_to_guid.get(nums[0]) if nums else None
+        return TICKET_URL_TEMPLATE.format(guid=guid) if guid else ""
+
+    for r in rows:
+        r["Ticket URL"] = first_ticket_url(r.get("Ticket Number", ""))
+    for d in new_detail_rows:
+        d["Ticket URL"] = first_ticket_url(d.get("Ticket Number", ""))
+    for d in completed_detail_rows:
+        d["Ticket URL"] = first_ticket_url(d.get("Ticket Number", ""))
+
     # --- DASHBOARD SHEET (created first = opens first) ---
     dash_ws = wb.active
     dash_ws.title = "Dashboard"
@@ -1173,6 +1203,11 @@ def generate_excel(rows):
                     f"{TFS_URL}/{quote(row_data.get('_project') or PROJECT)}/"
                     f"_workitems/edit/{row_data['Azure ID']}"
                 )
+                cell.font = link_font
+
+            # Ticket Number links to the Dynamics ticket record (first ticket)
+            if col_name == "Ticket Number" and row_data.get("Ticket URL"):
+                cell.hyperlink = row_data["Ticket URL"]
                 cell.font = link_font
 
             # Determine fill
@@ -1631,6 +1666,7 @@ def build_new_stories_sheet(wb, detail_rows):
             c.border = thin_b
 
         data_font = Font(name="Segoe UI", size=10)
+        link_font = Font(name="Segoe UI", size=10, color="0563C1", underline="single")
         data_align = Alignment(vertical="top", wrap_text=True)
 
         r = header_row + 1
@@ -1643,6 +1679,9 @@ def build_new_stories_sheet(wb, detail_rows):
                 c.font = data_font
                 c.alignment = data_align
                 c.border = thin_b
+                if col_idx == 7 and d.get("Ticket URL"):
+                    c.hyperlink = d["Ticket URL"]
+                    c.font = link_font
             r += 1
         last_row = r - 1
 
@@ -1713,6 +1752,7 @@ def build_completed_stories_sheet(wb, detail_rows):
             c.border = thin_b
 
         data_font = Font(name="Segoe UI", size=10)
+        link_font = Font(name="Segoe UI", size=10, color="0563C1", underline="single")
         data_align = Alignment(vertical="top", wrap_text=True)
 
         r = header_row + 1
@@ -1725,6 +1765,9 @@ def build_completed_stories_sheet(wb, detail_rows):
                 c.font = data_font
                 c.alignment = data_align
                 c.border = thin_b
+                if col_idx == 7 and d.get("Ticket URL"):
+                    c.hyperlink = d["Ticket URL"]
+                    c.font = link_font
             r += 1
         last_row = r - 1
 
@@ -1825,6 +1868,7 @@ def build_tickets_sheet(wb, ticket_data):
             c.border = thin_b
 
         data_font = Font(name="Segoe UI", size=10)
+        link_font = Font(name="Segoe UI", size=10, color="0563C1", underline="single")
         data_align = Alignment(vertical="top", wrap_text=True)
 
         # Sort: severity order, not-covered first, then ticket number
@@ -1845,7 +1889,11 @@ def build_tickets_sheet(wb, ticket_data):
             for col_idx, val in enumerate(vals, 1):
                 c = ws.cell(row=r, column=col_idx, value=val)
                 c.border = thin_b
-                if col_idx == 6:
+                if col_idx == 4 and t.get("guid"):
+                    c.hyperlink = TICKET_URL_TEMPLATE.format(guid=t["guid"])
+                    c.font = link_font
+                    c.alignment = data_align
+                elif col_idx == 6:
                     c.font = covered_font if covered else not_covered_font
                     c.fill = covered_fill if covered else not_covered_fill
                     c.alignment = Alignment(horizontal="center", vertical="center")
@@ -1972,6 +2020,7 @@ def main():
 
         # 4. Map + filter
         print(f"\n[4/5] Mapping work items and filtering...")
+        t0 = time.time()
         print(f"      Roadmap cutoff: {ROADMAP_CUTOFF_DATE} (stories done before this are excluded)")
         all_rows = []
         skipped_no_parent = 0
