@@ -153,11 +153,12 @@ TICKET_URL_TEMPLATE = (
 
 # Only tickets matching these are tracked in the analysis:
 # - Request Type must be one of TICKET_REQUEST_TYPES (exact, case-insensitive)
-# - Status must contain one of TICKET_ALLOWED_STATUS_KEYWORDS
-#   (emoji prefixes like 🚩 are ignored — 'Open'/'New' and 'Committed' are kept,
-#   anything else — On hold / Resolved / Cancelled / Closed / Rejected — is excluded)
+# - Status must NOT contain any TICKET_EXCLUDED_STATUS_KEYWORDS (Rejected and
+#   On hold are dropped; Open / New / Committed / Resolved / Closed all stay —
+#   resolved tickets count as Done; resolved tickets without any roadmap
+#   reference are filtered out later)
 TICKET_REQUEST_TYPES = ["CR"]
-TICKET_ALLOWED_STATUS_KEYWORDS = ["committed", "open", "new"]
+TICKET_EXCLUDED_STATUS_KEYWORDS = ["rejected", "on hold"]
 
 # Ticket numbers referenced by the roadmap but missing from the ticket export
 # are listed on the dashboard up to this many
@@ -899,18 +900,18 @@ def load_ticket_export(path):
 
 
 def is_tracked_ticket(ticket):
-    """A ticket is tracked only if its Request Type is one of
-    TICKET_REQUEST_TYPES and its Status contains one of
-    TICKET_ALLOWED_STATUS_KEYWORDS (emoji prefixes are ignored —
-    e.g. '🚩Open' counts as 'Open')."""
+    """A ticket is tracked if its Request Type is one of TICKET_REQUEST_TYPES
+    and its Status does NOT contain any TICKET_EXCLUDED_STATUS_KEYWORDS.
+    (Emoji prefixes are ignored — '🚩Open' counts as 'Open'. Resolved and
+    Closed tickets stay tracked: they count as Done when linked to the
+    roadmap and are dropped entirely when not linked.)"""
     allowed_types = [t.lower() for t in TICKET_REQUEST_TYPES]
     rt = str(ticket.get("request_type", "")).strip().lower()
     if allowed_types and rt not in allowed_types:
         return False
-    if TICKET_ALLOWED_STATUS_KEYWORDS:
-        st = str(ticket.get("status", "")).strip().lower()
-        if not any(k in st for k in [s.lower() for s in TICKET_ALLOWED_STATUS_KEYWORDS]):
-            return False
+    st = str(ticket.get("status", "")).strip().lower()
+    if any(k in st for k in [s.lower() for s in TICKET_EXCLUDED_STATUS_KEYWORDS]):
+        return False
     return True
 
 
@@ -919,13 +920,15 @@ def build_ticket_analysis(rows):
     lowest-level PBI value overrides the Feature value, empty story
     inherits the Feature's value) against the ticket system export.
 
-    Only tracked tickets are analyzed (Request Type in
-    TICKET_REQUEST_TYPES and Status in TICKET_ALLOWED_STATUS_KEYWORDS).
+    Tracked tickets are CR tickets that are not Rejected / On hold.
+    Per ticket, Progress = share of linked roadmap stories that are Done.
+    Resolved/closed tickets count as Done when linked to the roadmap and
+    are dropped entirely when they have no roadmap reference.
 
-    Returns a dict with the export path, per-ticket covered flags,
-    per-severity and per-module stats and tickets referenced by the
-    roadmap but missing from the export — or None if the export is
-    unavailable."""
+    Returns a dict with the export path, per-ticket covered flags and
+    progress, per-severity/per-module progress stats and tickets
+    referenced by the roadmap but missing from the export — or None if
+    the export is unavailable."""
     export_path = find_latest_ticket_export()
     if not export_path:
         print("      No ticket export found — ticket analysis skipped")
@@ -937,7 +940,7 @@ def build_ticket_analysis(rows):
         print("      WARNING: ticket export has no recognizable sheet — analysis skipped")
         return None
 
-    # Filter to tracked tickets only (CR + Committed/Open/New)
+    # Filter to tracked tickets (CR, not Rejected / On hold)
     tracked = [t for t in tickets if is_tracked_ticket(t)]
     excluded = len(tickets) - len(tracked)
 
@@ -954,7 +957,7 @@ def build_ticket_analysis(rows):
 
     if excluded:
         print(f"      {excluded} tickets excluded (Request Type not in "
-              f"{TICKET_REQUEST_TYPES} or status not Committed/Open/New)")
+              f"{TICKET_REQUEST_TYPES} or Rejected / On hold)")
     if not tracked:
         print("      WARNING: no tracked tickets in the export — analysis skipped")
         return None
@@ -966,31 +969,77 @@ def build_ticket_analysis(rows):
         for num in parse_ticket_numbers(r.get("Ticket Number", "")):
             covered_set.add(num)
 
+    # PBI progress per ticket number: how many of the linked stories are Done
+    ticket_pbis = defaultdict(lambda: {"total": 0, "done": 0})
+    for r in rows:
+        if r.get("_item_type") != "story":
+            continue
+        for num in parse_ticket_numbers(r.get("Ticket Number", "")):
+            stats = ticket_pbis[num]
+            stats["total"] += 1
+            if r.get("Status") == "Done":
+                stats["done"] += 1
+
+    # Progress per ticket; resolved/closed tickets without any roadmap
+    # reference are dropped entirely
+    kept = []
+    dropped_resolved = 0
+    for t in tracked:
+        st = str(t.get("status", "")).strip().lower()
+        t["resolved"] = "resolved" in st or "closed" in st
+        if t["resolved"] and t["number"] not in covered_set:
+            dropped_resolved += 1
+            continue
+        if t["resolved"]:
+            t["progress"] = 1.0  # resolved/closed counts as fully completed
+        else:
+            stats = ticket_pbis.get(t["number"], {"total": 0, "done": 0})
+            t["progress"] = (stats["done"] / stats["total"]) if stats["total"] else None
+        kept.append(t)
+    tracked = kept
+    excluded += dropped_resolved
+    if dropped_resolved:
+        print(f"      {dropped_resolved} resolved/closed tickets without roadmap references dropped")
+
     per_severity = {}
     per_module = {}
     covered_total = 0
+    cat_counts = {"Done": 0, "In Progress": 0, "Not Started": 0, "Not Covered": 0}
+
+    def progress_category(covered, progress):
+        if not covered:
+            return "Not Covered"
+        if progress is not None and progress >= 1:
+            return "Done"
+        if progress is not None and progress > 0:
+            return "In Progress"
+        return "Not Started"
+
     for t in tracked:
-        t["covered"] = t["number"] in covered_set
-        if t["covered"]:
+        covered = t["covered"] = t["number"] in covered_set
+        cat = t["category"] = progress_category(covered, t["progress"])
+        cat_counts[cat] += 1
+        if covered:
             covered_total += 1
 
         sev = t.get("severity") or "Unknown"
-        stats = per_severity.setdefault(sev, {"total": 0, "covered": 0})
+        stats = per_severity.setdefault(sev, {"total": 0, "Done": 0, "In Progress": 0,
+                                              "Not Started": 0, "Not Covered": 0})
         stats["total"] += 1
-        if t["covered"]:
-            stats["covered"] += 1
+        stats[cat] += 1
 
         mod = t.get("module") or "Unknown"
         stats = per_module.setdefault(mod, {"total": 0, "covered": 0})
         stats["total"] += 1
-        if t["covered"]:
+        if covered:
             stats["covered"] += 1
 
     export_ids = {t["number"] for t in tickets}
     missing_from_export = sorted(covered_set - export_ids, key=ticket_number_sort_key)
 
-    print(f"      {len(tracked)} tracked tickets — covered: {covered_total}, "
-          f"not covered: {len(tracked) - covered_total}")
+    print(f"      {len(tracked)} tracked tickets — Done: {cat_counts['Done']}, "
+          f"In Progress: {cat_counts['In Progress']}, Not Started: {cat_counts['Not Started']}, "
+          f"Not Covered: {cat_counts['Not Covered']}")
     if missing_from_export:
         print(f"      {len(missing_from_export)} ticket numbers referenced in the roadmap are not in the export")
 
@@ -1004,6 +1053,7 @@ def build_ticket_analysis(rows):
         "total": len(tracked),
         "covered_total": covered_total,
         "not_covered_total": len(tracked) - covered_total,
+        "cat_counts": cat_counts,
         "missing_from_export": missing_from_export,
         "roadmap_ticket_count": len(covered_set),
         "number_to_priority": number_to_priority,
@@ -1605,22 +1655,24 @@ def build_dashboard(dash_ws, rows, feature_status, new_data, ticket_data=None):
     c.font = Font(name="Segoe UI", size=9, italic=True, color="808080" if completed_list else "999999")
     dash_ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
 
-    # --- Section 5: Ticket System Analysis (work in progress) ---
+    # --- Section 5: Ticket System Analysis & Progress ---
     row += 2
-    row = write_section(row, "Ticket System Analysis (Work in Progress)", 4)
+    row = write_section(row, "Ticket System Analysis & Progress", 6)
 
     if ticket_data:
-        row = write_table_header(row, ["Severity", "Tickets", "Covered by Roadmap", "Not Covered"])
+        row = write_table_header(row, ["Severity", "Tickets", "Done", "In Progress", "Not Started", "Not Covered"])
 
         sevs = sorted(ticket_data["per_severity"].keys(), key=severity_sort_key)
         for sev in sevs:
             s = ticket_data["per_severity"][sev]
-            row = write_data_row(row, [sev, s["total"], s["covered"], s["total"] - s["covered"]])
+            row = write_data_row(row, [sev, s["total"], s["Done"], s["In Progress"],
+                                       s["Not Started"], s["Not Covered"]])
 
+        cc = ticket_data["cat_counts"]
         row = write_data_row(
             row,
-            ["Total", ticket_data["total"], ticket_data["covered_total"],
-             ticket_data["not_covered_total"]],
+            ["Total", ticket_data["total"], cc["Done"], cc["In Progress"],
+             cc["Not Started"], cc["Not Covered"]],
             total=True,
         )
 
@@ -1644,15 +1696,16 @@ def build_dashboard(dash_ws, rows, feature_status, new_data, ticket_data=None):
             total=True,
         )
 
-        # Work-in-progress disclaimer
+        # Progress explanation
         row += 1
         c = dash_ws.cell(
             row=row, column=1,
-            value=("Note: the ticket system analysis is still a work in progress — only the "
-                   "number of covered tickets is accurate. Tickets shown as 'Not Covered' may "
-                   "still be covered but are not yet linked to a PBI or Feature in Azure DevOps."),
+            value=("Progress = share of linked roadmap items (PBIs) that are Done. 'Done' = all linked PBIs "
+                   "completed or the ticket is resolved/closed in the ticket system. Yellow rows on the Tickets "
+                   "sheet are 100% complete in ADO but still open there. Resolved tickets without any roadmap "
+                   "link are excluded."),
         )
-        c.font = Font(name="Segoe UI", size=9, italic=True, color="C00000")
+        c.font = Font(name="Segoe UI", size=9, italic=True, color="808080")
         dash_ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
 
         # Ticket numbers referenced by the roadmap but missing from the export
@@ -1685,7 +1738,7 @@ def build_dashboard(dash_ws, rows, feature_status, new_data, ticket_data=None):
             row=row, column=1,
             value=(f"Ticket analysis skipped — no export found (pattern '{TICKET_EXPORT_PATTERN}' in "
                    f"'{TICKET_EXPORT_FOLDER}') or no tracked tickets "
-                   f"(Request Type '{'/'.join(TICKET_REQUEST_TYPES)}' with status Committed / Open (New))."),
+                   f"(Request Type '{'/'.join(TICKET_REQUEST_TYPES)}', excluding Rejected / On hold)."),
         )
         c.font = Font(name="Segoe UI", size=10, italic=True, color="999999")
         dash_ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
@@ -1859,16 +1912,20 @@ def build_completed_stories_sheet(wb, detail_rows):
 
 
 def build_tickets_sheet(wb, ticket_data):
-    """Dedicated 'Tickets' sheet: every ticket from the ticket system
-    export with name, severity, number, status and a 'Covered by
-    Roadmap' flag — as a real Excel Table (filter dropdowns + banded
-    rows). Sorted by severity, then not-covered first, then ticket
-    number. Skipped gracefully when the export is unavailable."""
+    """Dedicated 'Tickets' sheet: every tracked ticket from the ticket
+    system export with name, module, severity, number, Progress, status
+    and a 'Covered by Roadmap' flag — as a real Excel Table (filter
+    dropdowns + banded rows). Progress = share of linked roadmap stories
+    that are Done ('Done' at 100%, empty at 0% / not covered); rows that
+    are 100% complete in ADO but still open in the ticket system are
+    highlighted faint yellow. Sorted by severity, then not-covered
+    first, then ticket number. Skipped gracefully when the export is
+    unavailable."""
     ws = wb.create_sheet("Tickets", 4)
     ws.sheet_properties.tabColor = "C55A11"
 
-    headers = ["Ticket Name", "Module", "Severity", "Ticket Number", "Status", "Covered by Roadmap"]
-    widths = [60, 22, 16, 16, 16, 20]
+    headers = ["Ticket Name", "Module", "Severity", "Ticket Number", "Progress", "Status", "Covered by Roadmap"]
+    widths = [60, 22, 16, 16, 12, 16, 20]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -1888,41 +1945,44 @@ def build_tickets_sheet(wb, ticket_data):
     covered_font = Font(name="Segoe UI", size=10, color="006100")
     not_covered_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
     not_covered_font = Font(name="Segoe UI", size=10, color="9C0006")
+    done_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    done_font = Font(name="Segoe UI", size=10, bold=True, color="006100")
+    highlight_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
 
-    # Title + WIP note
+    # Title + note
     if ticket_data:
         c = ws.cell(row=1, column=1,
                     value=f"Ticket System Analysis — {os.path.basename(ticket_data['export_path'])}")
         c.font = title_font
-        ws.merge_cells("A1:F1")
+        ws.merge_cells("A1:G1")
 
         c = ws.cell(row=2, column=1,
-                    value=("Work in progress: only the number of covered tickets is accurate — "
-                           "tickets marked as 'No' may still be covered but are not yet linked "
-                           "to a PBI or Feature in Azure DevOps."))
+                    value=("Progress = share of linked roadmap items (PBIs) that are Done. 'Done' = all linked "
+                           "PBIs completed or the ticket is resolved/closed. Yellow rows are 100% complete in "
+                           "ADO but still open in the ticket system."))
         c.font = note_font
-        ws.merge_cells("A2:F2")
+        ws.merge_cells("A2:G2")
 
         excluded = ticket_data.get("excluded_total", 0)
-        filter_note = (f"Tracking Request Type '{'/'.join(TICKET_REQUEST_TYPES)}' with status "
-                       f"Committed / Open (New) only")
+        filter_note = (f"Tracking Request Type '{'/'.join(TICKET_REQUEST_TYPES)}' — excluding Rejected / On hold "
+                       f"and resolved tickets without roadmap references")
         if excluded:
-            filter_note += f" — {excluded} tickets of other types/statuses excluded"
+            filter_note += f" — {excluded} tickets excluded"
         c = ws.cell(row=3, column=1, value=filter_note)
         c.font = meta_font
-        ws.merge_cells("A3:F3")
+        ws.merge_cells("A3:G3")
 
         header_row = 4
     else:
         c = ws.cell(row=1, column=1, value="Ticket System Analysis")
         c.font = title_font
-        ws.merge_cells("A1:F1")
+        ws.merge_cells("A1:G1")
 
         c = ws.cell(row=2, column=1,
                     value=(f"No ticket export found (pattern '{TICKET_EXPORT_PATTERN}' in "
                            f"'{TICKET_EXPORT_FOLDER}') — ticket analysis skipped."))
         c.font = meta_font
-        ws.merge_cells("A2:F2")
+        ws.merge_cells("A2:G2")
 
         header_row = 4
 
@@ -1948,30 +2008,44 @@ def build_tickets_sheet(wb, ticket_data):
             ),
         )
 
+        def progress_text(progress):
+            if progress is None or progress <= 0:
+                return ""  # not covered or 0% -> empty
+            if progress >= 1:
+                return "Done"
+            return f"{round(progress * 100)}%"
+
         r = header_row + 1
         for t in tickets:
             covered = t.get("covered")
+            progress = t.get("progress")
+            row_highlight = (progress is not None and progress >= 1 and not t.get("resolved"))
             vals = [t.get("name", ""), t.get("module", ""), t.get("severity", ""),
-                    t.get("number", ""), t.get("status", ""), "Yes" if covered else "No"]
+                    t.get("number", ""), progress_text(progress), t.get("status", ""),
+                    "Yes" if covered else "No"]
             for col_idx, val in enumerate(vals, 1):
                 c = ws.cell(row=r, column=col_idx, value=val)
                 c.border = thin_b
-                if col_idx == 4 and t.get("guid"):
-                    c.hyperlink = TICKET_URL_TEMPLATE.format(guid=t["guid"])
-                    c.font = link_font
-                    c.alignment = data_align
-                elif col_idx == 6:
+                c.font = data_font
+                c.alignment = data_align
+                if row_highlight:
+                    c.fill = highlight_fill
+                if col_idx == 5 and progress is not None and progress >= 1:
+                    c.fill = done_fill
+                    c.font = done_font
+                    c.alignment = Alignment(horizontal="center", vertical="center")
+                elif col_idx == 7:
                     c.font = covered_font if covered else not_covered_font
                     c.fill = covered_fill if covered else not_covered_fill
                     c.alignment = Alignment(horizontal="center", vertical="center")
-                else:
-                    c.font = data_font
-                    c.alignment = data_align
+                if col_idx == 4 and t.get("guid"):
+                    c.hyperlink = TICKET_URL_TEMPLATE.format(guid=t["guid"])
+                    c.font = link_font
             r += 1
         last_row = r - 1
 
         # Real Excel Table -> filter dropdowns + banded styling
-        table_ref = f"A{header_row}:F{last_row}"
+        table_ref = f"A{header_row}:G{last_row}"
         tab = Table(displayName="TicketsTable", ref=table_ref,
                     autoFilter=AutoFilter(ref=table_ref))
         tab.tableColumns = [TableColumn(id=i + 1, name=h) for i, h in enumerate(headers)]
@@ -1986,8 +2060,8 @@ def build_tickets_sheet(wb, ticket_data):
         ws.freeze_panes = f"A{header_row + 1}"
     elif ticket_data:
         c = ws.cell(row=header_row, column=1,
-                    value="No tracked tickets in the export "
-                          f"(Request Type '{'/'.join(TICKET_REQUEST_TYPES)}' with status Committed / Open (New))")
+                    value=f"No tracked tickets in the export "
+                          f"(Request Type '{'/'.join(TICKET_REQUEST_TYPES)}', excluding Rejected / On hold)")
         c.font = Font(name="Segoe UI", size=10, italic=True, color="999999")
 
 
