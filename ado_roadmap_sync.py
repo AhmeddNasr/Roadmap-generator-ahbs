@@ -40,8 +40,10 @@ import base64
 import re
 import os
 import sys
+import time
 import fnmatch
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from collections import defaultdict
 from openpyxl import Workbook, load_workbook
@@ -57,7 +59,12 @@ from urllib.parse import quote
 
 TFS_URL = "http://ahq-tfs-azure/DefaultCollection"
 PAT = "gym5zjd2luca3exar5mc2izkjsu7hudv4bxbaxz6bixundvpskjq"
-OUTPUT_FOLDER = os.path.dirname(os.path.abspath(__file__))
+# Folder where the script/exe lives — output Excel and the ticket export
+# are expected here. PyInstaller-aware: when frozen, use the exe's folder
+if getattr(sys, "frozen", False):
+    OUTPUT_FOLDER = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    OUTPUT_FOLDER = os.path.dirname(os.path.abspath(__file__))
 API_VERSION = "5.1"
 
 PROJECT = "HMIS"
@@ -139,8 +146,9 @@ TICKET_ALLOWED_STATUS_KEYWORDS = ["committed", "open", "new"]
 # are listed on the dashboard up to this many
 TICKET_MISSING_LIST_MAX = 20
 
-DETAILS_BATCH = 50
+DETAILS_BATCH = 200
 PARENTS_BATCH = 200
+MAX_WORKERS = 6  # parallel batch downloads (network round-trips are the bottleneck)
 
 grandparent_assignee_lookup = {}
 
@@ -178,13 +186,13 @@ def run_wiql(query, top=5000):
 def fetch_work_items_with_relations(ids):
     if not ids:
         return []
-    all_items = []
-    for i in range(0, len(ids), DETAILS_BATCH):
-        batch = ids[i:i + DETAILS_BATCH]
+    batches = [ids[i:i + DETAILS_BATCH] for i in range(0, len(ids), DETAILS_BATCH)]
+    total = len(batches)
+    print(f"      Fetching {len(ids)} items in {total} batches "
+          f"(batch size {DETAILS_BATCH}, up to {min(MAX_WORKERS, total)} in parallel)...")
+
+    def fetch_batch(batch_num, batch):
         ids_param = ",".join(str(x) for x in batch)
-        batch_num = (i // DETAILS_BATCH) + 1
-        total = (len(ids) + DETAILS_BATCH - 1) // DETAILS_BATCH
-        print(f"      Batch {batch_num}/{total}: {len(batch)} items...")
         url = (
             f"{TFS_URL}/_apis/wit/workitems"
             f"?ids={ids_param}&$expand=relations&api-version={API_VERSION}"
@@ -192,29 +200,37 @@ def fetch_work_items_with_relations(ids):
         try:
             resp = requests.get(url, headers=get_auth_header(), timeout=120)
             if resp.status_code == 404:
-                continue
+                return []
             resp.raise_for_status()
-            all_items.extend(resp.json().get("value", []))
+            return resp.json().get("value", [])
         except Exception as e:
             print(f"      ERROR in batch {batch_num}: {e}")
             print(f"      Retrying individually...")
+            out = []
             for wid in batch:
                 try:
                     url2 = f"{TFS_URL}/_apis/wit/workItems/{wid}?$expand=relations&api-version={API_VERSION}"
                     r2 = requests.get(url2, headers=get_auth_header(), timeout=30)
                     if r2.status_code == 200:
-                        all_items.append(r2.json())
-                except:
+                        out.append(r2.json())
+                except Exception:
                     print(f"      Skipped ID {wid}")
+            return out
+
+    all_items = []
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, total)) as executor:
+        futures = [executor.submit(fetch_batch, n, b) for n, b in enumerate(batches, 1)]
+        for fut in as_completed(futures):
+            all_items.extend(fut.result())
     return all_items
 
 
 def fetch_work_items_basic(ids):
     if not ids:
         return {}
-    lookup = {}
-    for i in range(0, len(ids), PARENTS_BATCH):
-        batch = ids[i:i + PARENTS_BATCH]
+    batches = [ids[i:i + PARENTS_BATCH] for i in range(0, len(ids), PARENTS_BATCH)]
+
+    def fetch_batch(batch):
         ids_param = ",".join(str(x) for x in batch)
         # No 'fields' restriction: fetches all populated fields so the
         # Custom.* roadmap fields come through on any work item type.
@@ -223,11 +239,19 @@ def fetch_work_items_basic(ids):
             f"?ids={ids_param}&api-version={API_VERSION}"
         )
         try:
-            resp = requests.get(url, headers=get_auth_header(), timeout=60)
+            resp = requests.get(url, headers=get_auth_header(), timeout=120)
             if resp.status_code == 404:
-                continue
+                return []
             resp.raise_for_status()
-            for wi in resp.json().get("value", []):
+            return resp.json().get("value", [])
+        except Exception as e:
+            print(f"      ERROR fetching parents batch: {e}")
+            return []
+
+    lookup = {}
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(batches))) as executor:
+        for value in executor.map(fetch_batch, batches):
+            for wi in value:
                 flds = wi.get("fields", {})
                 lookup[wi["id"]] = {
                     "title": flds.get("System.Title", ""),
@@ -235,8 +259,6 @@ def fetch_work_items_basic(ids):
                     "assigned_to": extract_display_name(flds.get("System.AssignedTo")),
                     "new_values": extract_new_values(flds),
                 }
-        except Exception as e:
-            print(f"      ERROR fetching parents: {e}")
     return lookup
 
 
@@ -401,9 +423,16 @@ def fetch_all_pbis():
         f"WHERE [System.TeamProject] IN ({projects_filter}) "
         f"AND [System.WorkItemType] IN ({types_filter}) "
         f"AND [System.State] <> 'Removed' "
+        # Server-side pre-filter: items Done before the roadmap cutoff are
+        # discarded during mapping anyway — never download them at all.
+        # (Delivery Date falls back to StateChangeDate for edge cases, so
+        # those items are still fetched and filtered locally.)
+        f"AND NOT ([System.State] IN ('Done', 'Closed') "
+        f"AND [Microsoft.VSTS.Common.ClosedDate] < '{ROADMAP_CUTOFF_DATE}') "
         f"ORDER BY [System.Id] DESC"
     )
-    print(f"\n[1/5] Querying {PROJECTS} for {PBI_TYPES} (excluding Removed)...")
+    print(f"\n[1/5] Querying {PROJECTS} for {PBI_TYPES} (excluding Removed, "
+          f"and Done before {ROADMAP_CUTOFF_DATE})...")
     refs = run_wiql(wiql)
     print(f"      Found {len(refs)} work items")
     if not refs:
@@ -1918,20 +1947,28 @@ def main():
         sys.exit(1)
 
     try:
+        t_start = time.time()
+
         # 1. Fetch PBIs
+        t0 = time.time()
         pbi_items = fetch_all_pbis()
+        print(f"      [1/5] took {time.time() - t0:.1f}s")
 
         # 2. Fetch orphan Features/Epics
+        t0 = time.time()
         orphan_items = fetch_all_features_and_epics()
+        print(f"      [2/5] took {time.time() - t0:.1f}s")
 
         # 3. Build parent + grandparent lookup
         print(f"\n[3/5] Building parent and grandparent (Epic) lookup...")
+        t0 = time.time()
         parent_lookup, grandparent_lookup, gp_assignee = build_parent_and_grandparent_lookup(
             pbi_items, orphan_items
         )
         global grandparent_assignee_lookup
         grandparent_assignee_lookup = gp_assignee
         print(f"      Parent lookup: {len(parent_lookup)} items")
+        print(f"      [3/5] took {time.time() - t0:.1f}s")
 
         # 4. Map + filter
         print(f"\n[4/5] Mapping work items and filtering...")
@@ -1986,6 +2023,7 @@ def main():
         for col in NEW_FIELD_REFS:
             n = sum(1 for r in all_rows if str(r.get(col, "") or "").strip())
             print(f"      '{col}' populated on {n} rows")
+        print(f"      [4/5] took {time.time() - t0:.1f}s")
 
         if not all_rows:
             print("\nNo work items match criteria. Exiting.")
@@ -1993,7 +2031,10 @@ def main():
 
         # 5. Generate Excel — fresh build from TFS every run, no carry-over
         print(f"\n[5/5] Generating Excel...")
+        t0 = time.time()
         output_file = generate_excel(all_rows)
+        print(f"      [5/5] took {time.time() - t0:.1f}s")
+        print(f"      Total run: {time.time() - t_start:.1f}s")
 
         print(f"\n{'=' * 60}")
         print(f"  SYNC COMPLETE")
