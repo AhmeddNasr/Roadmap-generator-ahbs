@@ -1,5 +1,5 @@
 # ============================================================
-# ADO Roadmap Sync Script v7
+# ADO Roadmap Sync Script v7.1
 # Pulls Product Backlog Items + orphan Features/Epics
 # from HMIS (TFS on-prem) and generates a roadmap Excel
 # matching the original format, with a Dashboard sheet.
@@ -11,6 +11,14 @@
 # ticket with name, severity, number, status and a
 # 'Covered by Roadmap' flag; the Dashboard shows tickets per
 # severity and covered/not-covered counts.
+#
+# New in v7.1: only 'Product Backlog Item' is fetched (Product Non
+# Backlog Item excluded). A 'Ticket Priority' column (from the ticket
+# system export) sits next to Ticket Number on the Roadmap and New
+# Stories sheets — when several tickets are linked, the highest-rated
+# ticket's priority wins (Critical > High > Medium > Normal). The
+# Completed Stories sheet also shows Ticket Number + Ticket Priority,
+# and the Tickets sheet now includes the ticket's Module.
 #
 # New in v6: no carry-over — the roadmap is built completely
 # fresh from TFS on every run.
@@ -40,6 +48,8 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo, TableColumn
+from openpyxl.worksheet.filters import AutoFilter
+from urllib.parse import quote
 
 # ============================================================
 # CONFIGURATION
@@ -55,7 +65,9 @@ PROJECT = "HMIS"
 # All projects to query
 PROJECTS = ["HMIS", "HR System", "Mobile Applications", "Websites"]
 
-PBI_TYPES = ["Product Backlog Item", "Product Non Backlog Item"]
+# Only real Product Backlog Items are pulled ('Product Non Backlog Item'
+# is intentionally excluded)
+PBI_TYPES = ["Product Backlog Item"]
 FEATURE_TYPES = ["Feature", "Epic"]
 
 ALLOWED_OWNERS = [
@@ -74,7 +86,7 @@ ALLOWED_OWNERS = [
 # its own value for that field (story level overrides feature level).
 NEW_FIELD_REFS = {
     "Ticket Number": "Custom.Ticketnumber",
-    "Business Value": "Custom.BusinessImpactValue",
+    "Notes": "Custom.BusinessImpactValue",
     "Category": "Custom.BusinessValueCategory",
     "Impact": "Custom.Impactlevel",
 }
@@ -527,9 +539,6 @@ def map_pbi_to_row(wi, parent_lookup, grandparent_lookup):
     working_status = fields.get("Custom.WorkingStatus", "")
     status = map_status(state, working_status)
 
-    # Priority from ADO
-    priority = fields.get("Microsoft.VSTS.Common.Priority", "")
-
     # Added on = PBI created date
     created_date = fields.get("System.CreatedDate", "")
     added_on = format_date(created_date)
@@ -561,18 +570,15 @@ def map_pbi_to_row(wi, parent_lookup, grandparent_lookup):
         "Module": module,
         "Business Area / Feature": feature,
         "Requirement": requirement,
-        "Reference ID": ref_id,
+        "Azure ID": ref_id,
         "Ticket Number": new_vals.get("Ticket Number", ""),
-        "Priority": priority,
         "Impact": new_vals.get("Impact", ""),
         "Status": status,
         "Added on": added_on,
         "Start Date": start_date,
         "Delivery Date": delivery_date,
-        "Stakeholder": "",
         "Category": new_vals.get("Category", ""),
-        "Business Value": new_vals.get("Business Value", ""),
-        "Reviewed": "",
+        "Notes": new_vals.get("Notes", ""),
         "_id": sync_id,
         "_item_type": "story",
         "_created_date": created_date,
@@ -608,7 +614,6 @@ def map_orphan_to_row(wi, parent_lookup, grandparent_lookup):
         business_area = title
 
     created_date = fields.get("System.CreatedDate", "")
-    priority = fields.get("Microsoft.VSTS.Common.Priority", "")
 
     # New fields: the feature's own values (inherited from its parent, if any)
     new_vals = resolve_new_values(fields, parent_id, parent_lookup)
@@ -618,18 +623,15 @@ def map_orphan_to_row(wi, parent_lookup, grandparent_lookup):
         "Module": module,
         "Business Area / Feature": business_area,
         "Requirement": title,
-        "Reference ID": "",
+        "Azure ID": "",
         "Ticket Number": new_vals.get("Ticket Number", ""),
-        "Priority": priority,
         "Impact": new_vals.get("Impact", ""),
         "Status": "Backlog",
         "Added on": format_date(created_date),
         "Start Date": "",
         "Delivery Date": "",
-        "Stakeholder": "",
         "Category": new_vals.get("Category", ""),
-        "Business Value": new_vals.get("Business Value", ""),
-        "Reviewed": "",
+        "Notes": new_vals.get("Notes", ""),
         "_id": str(wi.get("id", "")),
         "_item_type": "feature",
         "_created_date": created_date,
@@ -726,6 +728,18 @@ def ticket_number_sort_key(number):
     """Numeric sort for ticket numbers ('3004' < '10000' < 'abc')."""
     n = str(number or "")
     return (0, int(n), "") if n.isdigit() else (1, 0, n)
+
+
+def resolve_ticket_priority(ticket_number_value, number_to_priority):
+    """Priority of the ticket(s) referenced by a Ticket Number value.
+    When several tickets are linked, the HIGHEST-RATED ticket's priority
+    wins (Critical > High > Medium > Normal, unknown values last).
+    Returns '' when no referenced ticket is found in the export."""
+    priorities = [number_to_priority.get(n) for n in parse_ticket_numbers(ticket_number_value)]
+    priorities = [p for p in priorities if p]
+    if not priorities:
+        return ""
+    return sorted(priorities, key=severity_sort_key)[0]
 
 
 def find_latest_ticket_export():
@@ -847,6 +861,15 @@ def build_ticket_analysis(rows):
     # Filter to tracked tickets only (CR + Committed/Open/New)
     tracked = [t for t in tickets if is_tracked_ticket(t)]
     excluded = len(tickets) - len(tracked)
+
+    # Ticket number -> priority lookup, built from ALL tickets in the
+    # export (not just tracked ones) so that resolved/inactive tickets
+    # referenced by the roadmap still resolve to their priority
+    number_to_priority = {}
+    for t in tickets:
+        if t["number"] not in number_to_priority:
+            number_to_priority[t["number"]] = t.get("severity") or ""
+
     if excluded:
         print(f"      {excluded} tickets excluded (Request Type not in "
               f"{TICKET_REQUEST_TYPES} or status not Committed/Open/New)")
@@ -901,6 +924,7 @@ def build_ticket_analysis(rows):
         "not_covered_total": len(tracked) - covered_total,
         "missing_from_export": missing_from_export,
         "roadmap_ticket_count": len(covered_set),
+        "number_to_priority": number_to_priority,
     }
 
 
@@ -911,12 +935,12 @@ def build_ticket_analysis(rows):
 def generate_excel(rows):
     print(f"\n      Generating Excel with {len(rows)} rows...")
 
-    # Compute feature group status for sorting and coloring
+    # Compute feature group status for coloring only (Done groups stay green)
     feature_status = compute_feature_group_status(rows)
 
-    # Sort: by feature group status (Done first), then by Business Area, then by status within group
+    # Sort: by Business Area, then by status within the group, then title.
+    # Feature groups are NOT pulled to the top anymore — colors only.
     rows.sort(key=lambda r: (
-        STATUS_ORDER.get(feature_status.get(r.get("Business Area / Feature", ""), "Backlog"), 99),
         r.get("Business Area / Feature", "") or "~",
         STATUS_ORDER.get(r.get("Status", "Backlog"), 99),
         r.get("Requirement", "") or "",
@@ -952,7 +976,8 @@ def generate_excel(rows):
             "Module": r.get("Module", ""),
             "Feature": r.get("Business Area / Feature", ""),
             "Story Title": r.get("Requirement", ""),
-            "Story ID": r.get("Reference ID", ""),
+            "Story ID": r.get("Azure ID", ""),
+            "Ticket Number": r.get("Ticket Number", ""),
             "Status": r.get("Status", ""),
             "Added on": r.get("Added on", ""),
             "_id": r.get("_id", ""),
@@ -982,7 +1007,8 @@ def generate_excel(rows):
             "Module": r.get("Module", ""),
             "Feature": r.get("Business Area / Feature", ""),
             "Story Title": r.get("Requirement", ""),
-            "Story ID": r.get("Reference ID", ""),
+            "Story ID": r.get("Azure ID", ""),
+            "Ticket Number": r.get("Ticket Number", ""),
             "Done Date": delivery,
             "_id": r.get("_id", ""),
         })
@@ -1008,6 +1034,22 @@ def generate_excel(rows):
     print("\n      Ticket system analysis...")
     ticket_data = build_ticket_analysis(rows)
 
+    # Ticket Priority for every row / detail row — from the ticket system
+    # export; the highest-rated linked ticket wins (Critical > High > ...)
+    ticket_priority_lookup = (ticket_data or {}).get("number_to_priority", {})
+    for r in rows:
+        r["Ticket Priority"] = resolve_ticket_priority(
+            r.get("Ticket Number", ""), ticket_priority_lookup
+        )
+    for d in new_detail_rows:
+        d["Ticket Priority"] = resolve_ticket_priority(
+            d.get("Ticket Number", ""), ticket_priority_lookup
+        )
+    for d in completed_detail_rows:
+        d["Ticket Priority"] = resolve_ticket_priority(
+            d.get("Ticket Number", ""), ticket_priority_lookup
+        )
+
     # --- DASHBOARD SHEET (created first = opens first) ---
     dash_ws = wb.active
     dash_ws.title = "Dashboard"
@@ -1023,18 +1065,16 @@ def generate_excel(rows):
         ("Module", 18),
         ("Business Area / Feature", 40),
         ("Requirement", 50),
-        ("Reference ID", 12),
+        ("Azure ID", 12),
         ("Ticket Number", 14),
-        ("Priority", 10),
+        ("Ticket Priority", 14),
         ("Impact", 12),
         ("Status", 14),
         ("Added on", 14),
         ("Start Date", 14),
         ("Delivery Date", 14),
-        ("Stakeholder", 25),
         ("Category", 18),
-        ("Business Value", 35),
-        ("Reviewed", 10),
+        ("Notes", 35),
     ]
 
     header_font = Font(name="Segoe UI", bold=True, color="FFFFFF", size=11)
@@ -1048,12 +1088,12 @@ def generate_excel(rows):
     )
 
     data_font = Font(name="Segoe UI", size=10)
+    link_font = Font(name="Segoe UI", size=10, color="0563C1", underline="single")
     data_align = Alignment(vertical="top", wrap_text=True)
     feature_font = Font(name="Segoe UI", size=10, bold=True)
     feature_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
 
-    # Feature group fully done = greenish
-    done_group_fill = PatternFill(start_color="D5E8D4", end_color="D5E8D4", fill_type="solid")
+    # Feature group fully done = green on the feature column only
     done_feature_fill = PatternFill(start_color="C6E0B4", end_color="C6E0B4", fill_type="solid")
 
     status_colors = {
@@ -1090,17 +1130,26 @@ def generate_excel(rows):
 
         for col_idx, (col_name, _) in enumerate(columns, 1):
             value = row_data.get(col_name, "")
+            # Long dash for empty fields
+            if value is None or (isinstance(value, str) and not value.strip()):
+                value = "—"
             cell = ws.cell(row=row_idx, column=col_idx, value=value)
             cell.font = data_font
             cell.alignment = data_align
             cell.border = thin_border
 
+            # Azure ID links straight to the work item in TFS
+            if col_name == "Azure ID" and row_data.get("Azure ID"):
+                cell.hyperlink = (
+                    f"{TFS_URL}/{quote(row_data.get('_project') or PROJECT)}/"
+                    f"_workitems/edit/{row_data['Azure ID']}"
+                )
+                cell.font = link_font
+
             # Determine fill
             if col_idx == feature_col_idx:
                 cell.font = feature_font
                 cell.fill = done_feature_fill if is_done_group else feature_fill
-            elif is_done_group:
-                cell.fill = done_group_fill
             elif status_fill and col_idx == status_col_idx:
                 cell.fill = status_fill
 
@@ -1521,8 +1570,9 @@ def build_new_stories_sheet(wb, detail_rows):
     ws = wb.create_sheet("New Stories", 2)
     ws.sheet_properties.tabColor = "70AD47"
 
-    headers = ["Owner", "Project", "Module", "Feature", "Story Title", "Story ID", "Status", "Added on"]
-    widths = [30, 20, 20, 42, 55, 12, 13, 13]
+    headers = ["Owner", "Project", "Module", "Feature", "Story Title", "Story ID",
+               "Ticket Number", "Ticket Priority", "Status", "Added on"]
+    widths = [30, 20, 20, 42, 55, 12, 14, 14, 13, 13]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -1539,7 +1589,7 @@ def build_new_stories_sheet(wb, detail_rows):
 
     c = ws.cell(row=1, column=1, value=f"New Stories & Features — Created After {CUTOFF_DATE}")
     c.font = title_font
-    ws.merge_cells("A1:H1")
+    ws.merge_cells("A1:J1")
 
     header_row = 3
 
@@ -1557,7 +1607,8 @@ def build_new_stories_sheet(wb, detail_rows):
         r = header_row + 1
         for d in detail_rows:
             vals = [d["Owner"], d["Project"], d["Module"], d["Feature"],
-                    d["Story Title"], d["Story ID"], d["Status"], d["Added on"]]
+                    d["Story Title"], d["Story ID"], d["Ticket Number"],
+                    d["Ticket Priority"], d["Status"], d["Added on"]]
             for col_idx, val in enumerate(vals, 1):
                 c = ws.cell(row=r, column=col_idx, value=val)
                 c.font = data_font
@@ -1567,7 +1618,9 @@ def build_new_stories_sheet(wb, detail_rows):
         last_row = r - 1
 
         # Real Excel Table -> filter dropdowns + banded styling
-        tab = Table(displayName="NewStoriesTable", ref=f"A{header_row}:H{last_row}")
+        table_ref = f"A{header_row}:J{last_row}"
+        tab = Table(displayName="NewStoriesTable", ref=table_ref,
+                    autoFilter=AutoFilter(ref=table_ref))
         tab.tableColumns = [TableColumn(id=i + 1, name=h) for i, h in enumerate(headers)]
         tab.tableStyleInfo = TableStyleInfo(
             name="TableStyleMedium2",
@@ -1592,8 +1645,9 @@ def build_completed_stories_sheet(wb, detail_rows):
     ws = wb.create_sheet("Completed Stories", 3)
     ws.sheet_properties.tabColor = "548235"
 
-    headers = ["Owner", "Project", "Module", "Feature", "Story Title", "Story ID", "Done Date"]
-    widths = [30, 20, 20, 42, 55, 12, 13]
+    headers = ["Owner", "Project", "Module", "Feature", "Story Title", "Story ID",
+               "Ticket Number", "Ticket Priority", "Done Date"]
+    widths = [30, 20, 20, 42, 55, 12, 14, 14, 13]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -1612,12 +1666,12 @@ def build_completed_stories_sheet(wb, detail_rows):
     c = ws.cell(row=1, column=1,
                 value="List of user stories delivered to the PO since the cut off")
     c.font = title_font
-    ws.merge_cells("A1:G1")
+    ws.merge_cells("A1:I1")
 
     c = ws.cell(row=2, column=1,
                 value=f"Stories set as Done after {CUTOFF_DATE}  |  {len(detail_rows)} user stories")
     c.font = meta_font
-    ws.merge_cells("A2:G2")
+    ws.merge_cells("A2:I2")
 
     header_row = 4
 
@@ -1635,7 +1689,8 @@ def build_completed_stories_sheet(wb, detail_rows):
         r = header_row + 1
         for d in detail_rows:
             vals = [d["Owner"], d["Project"], d["Module"], d["Feature"],
-                    d["Story Title"], d["Story ID"], d["Done Date"]]
+                    d["Story Title"], d["Story ID"], d["Ticket Number"],
+                    d["Ticket Priority"], d["Done Date"]]
             for col_idx, val in enumerate(vals, 1):
                 c = ws.cell(row=r, column=col_idx, value=val)
                 c.font = data_font
@@ -1645,7 +1700,9 @@ def build_completed_stories_sheet(wb, detail_rows):
         last_row = r - 1
 
         # Real Excel Table -> filter dropdowns + banded styling
-        tab = Table(displayName="CompletedStoriesTable", ref=f"A{header_row}:G{last_row}")
+        table_ref = f"A{header_row}:I{last_row}"
+        tab = Table(displayName="CompletedStoriesTable", ref=table_ref,
+                    autoFilter=AutoFilter(ref=table_ref))
         tab.tableColumns = [TableColumn(id=i + 1, name=h) for i, h in enumerate(headers)]
         tab.tableStyleInfo = TableStyleInfo(
             name="TableStyleMedium2",
@@ -1671,8 +1728,8 @@ def build_tickets_sheet(wb, ticket_data):
     ws = wb.create_sheet("Tickets", 4)
     ws.sheet_properties.tabColor = "C55A11"
 
-    headers = ["Ticket Name", "Severity", "Ticket Number", "Status", "Covered by Roadmap"]
-    widths = [60, 16, 16, 16, 20]
+    headers = ["Ticket Name", "Module", "Severity", "Ticket Number", "Status", "Covered by Roadmap"]
+    widths = [60, 22, 16, 16, 16, 20]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -1698,14 +1755,14 @@ def build_tickets_sheet(wb, ticket_data):
         c = ws.cell(row=1, column=1,
                     value=f"Ticket System Analysis — {os.path.basename(ticket_data['export_path'])}")
         c.font = title_font
-        ws.merge_cells("A1:E1")
+        ws.merge_cells("A1:F1")
 
         c = ws.cell(row=2, column=1,
                     value=("Work in progress: only the number of covered tickets is accurate — "
                            "tickets marked as 'No' may still be covered but are not yet linked "
                            "to a PBI or Feature in Azure DevOps."))
         c.font = note_font
-        ws.merge_cells("A2:E2")
+        ws.merge_cells("A2:F2")
 
         excluded = ticket_data.get("excluded_total", 0)
         filter_note = (f"Tracking Request Type '{'/'.join(TICKET_REQUEST_TYPES)}' with status "
@@ -1714,19 +1771,19 @@ def build_tickets_sheet(wb, ticket_data):
             filter_note += f" — {excluded} tickets of other types/statuses excluded"
         c = ws.cell(row=3, column=1, value=filter_note)
         c.font = meta_font
-        ws.merge_cells("A3:E3")
+        ws.merge_cells("A3:F3")
 
         header_row = 4
     else:
         c = ws.cell(row=1, column=1, value="Ticket System Analysis")
         c.font = title_font
-        ws.merge_cells("A1:E1")
+        ws.merge_cells("A1:F1")
 
         c = ws.cell(row=2, column=1,
                     value=(f"No ticket export found (pattern '{TICKET_EXPORT_PATTERN}' in "
                            f"'{TICKET_EXPORT_FOLDER}') — ticket analysis skipped."))
         c.font = meta_font
-        ws.merge_cells("A2:E2")
+        ws.merge_cells("A2:F2")
 
         header_row = 4
 
@@ -1754,12 +1811,12 @@ def build_tickets_sheet(wb, ticket_data):
         r = header_row + 1
         for t in tickets:
             covered = t.get("covered")
-            vals = [t.get("name", ""), t.get("severity", ""), t.get("number", ""),
-                    t.get("status", ""), "Yes" if covered else "No"]
+            vals = [t.get("name", ""), t.get("module", ""), t.get("severity", ""),
+                    t.get("number", ""), t.get("status", ""), "Yes" if covered else "No"]
             for col_idx, val in enumerate(vals, 1):
                 c = ws.cell(row=r, column=col_idx, value=val)
                 c.border = thin_b
-                if col_idx == 5:
+                if col_idx == 6:
                     c.font = covered_font if covered else not_covered_font
                     c.fill = covered_fill if covered else not_covered_fill
                     c.alignment = Alignment(horizontal="center", vertical="center")
@@ -1770,7 +1827,9 @@ def build_tickets_sheet(wb, ticket_data):
         last_row = r - 1
 
         # Real Excel Table -> filter dropdowns + banded styling
-        tab = Table(displayName="TicketsTable", ref=f"A{header_row}:E{last_row}")
+        table_ref = f"A{header_row}:F{last_row}"
+        tab = Table(displayName="TicketsTable", ref=table_ref,
+                    autoFilter=AutoFilter(ref=table_ref))
         tab.tableColumns = [TableColumn(id=i + 1, name=h) for i, h in enumerate(headers)]
         tab.tableStyleInfo = TableStyleInfo(
             name="TableStyleMedium2",
@@ -1841,7 +1900,7 @@ def main():
             pass
 
     print("=" * 60)
-    print("  ADO Roadmap Sync v7")
+    print("  ADO Roadmap Sync v7.1")
     print("  TFS: " + TFS_URL)
     print(f"  Projects: {', '.join(PROJECTS)}")
     print("=" * 60)
