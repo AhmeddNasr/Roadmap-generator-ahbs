@@ -1,5 +1,5 @@
 # ============================================================
-# ADO Roadmap Sync Script v7.1
+# ADO Roadmap Sync Script v7.3
 # Pulls Product Backlog Items + orphan Features/Epics
 # from HMIS (TFS on-prem) and generates a roadmap Excel
 # matching the original format, with a Dashboard sheet.
@@ -19,6 +19,18 @@
 # ticket's priority wins (Critical > High > Medium > Normal). The
 # Completed Stories sheet also shows Ticket Number + Ticket Priority,
 # and the Tickets sheet now includes the ticket's Module.
+#
+# New in v7.2: a 'Region' column (from the ticket export's
+# 'Name (Business Unit) (Business Unit)' column) sits next to Ticket
+# Priority on the Roadmap, New Stories and Completed Stories sheets;
+# the Tickets sheet includes it too.
+#
+# New in v7.3: the Tickets sheet's 'Progress' column is now 'Azure
+# Status' — empty when every linked story is Backlog, 'Development'
+# once at least one story left Backlog, 'Testing' when all stories are
+# Testing or Done, 'Done' when all stories are Done (or the ticket is
+# resolved/closed). The Azure ID column is also populated for orphan
+# Feature/Epic rows (the feature's/epic's own ID) instead of empty.
 #
 # New in v6: no carry-over — the roadmap is built completely
 # fresh from TFS on every run.
@@ -139,6 +151,8 @@ TICKET_EXPORT_COLUMNS = {
     "status": ["Status"],
     "request_type": ["Request Type", "Type"],
     "module": ["Subcategory", "Module"],
+    # Business Unit the ticket belongs to (Region column in the output)
+    "region": ["Name (Business Unit) (Business Unit)", "Name (Business Unit)"],
     # Dynamics record GUID — used to build the ticket deep link
     "guid": ["(Do Not Modify) All Requests ID", "All Requests ID"],
 }
@@ -701,7 +715,9 @@ def map_orphan_to_row(wi, parent_lookup, grandparent_lookup):
         "Module": module,
         "Business Area / Feature": business_area,
         "Requirement": title,
-        "Azure ID": "",
+        # The row IS the feature/epic — show its own Azure ID (previously
+        # empty; the Requirement column displays the feature/epic title)
+        "Azure ID": str(wi.get("id", "")),
         "Standard Weight": resolve_standard_weight(fields),
         "Ticket Number": new_vals.get("Ticket Number", ""),
         "Impact": new_vals.get("Impact", ""),
@@ -821,6 +837,44 @@ def resolve_ticket_priority(ticket_number_value, number_to_priority):
     return sorted(priorities, key=severity_sort_key)[0]
 
 
+def resolve_ticket_region(ticket_number_value, number_to_region):
+    """Region (Business Unit) of the ticket(s) referenced by a Ticket
+    Number value — the first referenced ticket that exists in the export
+    (and has a Business Unit) wins. Returns '' when none is found."""
+    for n in parse_ticket_numbers(ticket_number_value):
+        region = number_to_region.get(n)
+        if region:
+            return region
+    return ""
+
+
+def azure_status_from_stories(status_counts, resolved=False):
+    """Azure Status of a ticket from the statuses of its linked stories,
+    following the flow empty > Development > Testing > Done:
+    - ''            every linked story is Backlog (or none are linked)
+    - 'Development' at least one story has left Backlog, but not all are
+                    Testing/Done
+    - 'Testing'     every linked story is Testing or Done (at least one
+                    Testing)
+    - 'Done'        every linked story is Done (or the ticket is
+                    resolved/closed in the ticket system)"""
+    if resolved:
+        return "Done"
+    total = sum(status_counts.values())
+    if not total:
+        return ""
+    done = status_counts.get("Done", 0)
+    testing = status_counts.get("Testing", 0)
+    development = status_counts.get("Development", 0)
+    if done == total:
+        return "Done"
+    if done + testing == total:
+        return "Testing"
+    if done + testing + development == 0:
+        return ""  # all Backlog
+    return "Development"
+
+
 def find_latest_ticket_export():
     """Locate the ticket system export Excel.
     TICKET_EXPORT_FOLDER can be a direct file path, or a folder in which
@@ -891,6 +945,7 @@ def load_ticket_export(path):
                         "status": str(get(row, "status") or "") or "Unknown",
                         "request_type": str(get(row, "request_type") or "").strip(),
                         "module": str(get(row, "module") or "").strip() or "Unknown",
+                        "region": str(get(row, "region") or "").strip(),
                         "guid": str(get(row, "guid") or "").strip(),
                     })
                 return tickets
@@ -949,11 +1004,14 @@ def build_ticket_analysis(rows):
     # referenced by the roadmap still resolve to their priority
     number_to_priority = {}
     number_to_guid = {}
+    number_to_region = {}
     for t in tickets:
         if t["number"] not in number_to_priority:
             number_to_priority[t["number"]] = t.get("severity") or ""
         if t["number"] not in number_to_guid and t.get("guid"):
             number_to_guid[t["number"]] = t["guid"]
+        if t["number"] not in number_to_region:
+            number_to_region[t["number"]] = t.get("region") or ""
 
     if excluded:
         print(f"      {excluded} tickets excluded (Request Type not in "
@@ -969,16 +1027,14 @@ def build_ticket_analysis(rows):
         for num in parse_ticket_numbers(r.get("Ticket Number", "")):
             covered_set.add(num)
 
-    # PBI progress per ticket number: how many of the linked stories are Done
-    ticket_pbis = defaultdict(lambda: {"total": 0, "done": 0})
+    # Linked-story statuses per ticket number (drives the Azure Status
+    # column: empty > Development > Testing > Done)
+    ticket_pbis = defaultdict(lambda: defaultdict(int))
     for r in rows:
         if r.get("_item_type") != "story":
             continue
         for num in parse_ticket_numbers(r.get("Ticket Number", "")):
-            stats = ticket_pbis[num]
-            stats["total"] += 1
-            if r.get("Status") == "Done":
-                stats["done"] += 1
+            ticket_pbis[num][r.get("Status", "Backlog")] += 1
 
     # Progress per ticket; resolved/closed tickets without any roadmap
     # reference are dropped entirely
@@ -990,11 +1046,9 @@ def build_ticket_analysis(rows):
         if t["resolved"] and t["number"] not in covered_set:
             dropped_resolved += 1
             continue
-        if t["resolved"]:
-            t["progress"] = 1.0  # resolved/closed counts as fully completed
-        else:
-            stats = ticket_pbis.get(t["number"], {"total": 0, "done": 0})
-            t["progress"] = (stats["done"] / stats["total"]) if stats["total"] else None
+        statuses = dict(ticket_pbis.get(t["number"], {}))
+        t["azure_status"] = azure_status_from_stories(statuses, t["resolved"])
+        t["progress"] = (statuses.get("Done", 0) / sum(statuses.values())) if statuses else None
         kept.append(t)
     tracked = kept
     excluded += dropped_resolved
@@ -1058,6 +1112,7 @@ def build_ticket_analysis(rows):
         "roadmap_ticket_count": len(covered_set),
         "number_to_priority": number_to_priority,
         "number_to_guid": number_to_guid,
+        "number_to_region": number_to_region,
     }
 
 
@@ -1184,6 +1239,22 @@ def generate_excel(rows):
             d.get("Ticket Number", ""), ticket_priority_lookup
         )
 
+    # Region (Business Unit) for every row / detail row — from the ticket
+    # system export; the first linked ticket found there wins
+    ticket_region_lookup = (ticket_data or {}).get("number_to_region", {})
+    for r in rows:
+        r["Region"] = resolve_ticket_region(
+            r.get("Ticket Number", ""), ticket_region_lookup
+        )
+    for d in new_detail_rows:
+        d["Region"] = resolve_ticket_region(
+            d.get("Ticket Number", ""), ticket_region_lookup
+        )
+    for d in completed_detail_rows:
+        d["Region"] = resolve_ticket_region(
+            d.get("Ticket Number", ""), ticket_region_lookup
+        )
+
     # Ticket deep links into Dynamics — first ticket listed in the cell
     number_to_guid = (ticket_data or {}).get("number_to_guid", {})
 
@@ -1218,6 +1289,7 @@ def generate_excel(rows):
         ("Standard Weight", 14),
         ("Ticket Number", 14),
         ("Ticket Priority", 14),
+        ("Region", 16),
         ("Impact", 12),
         ("Status", 14),
         ("Added on", 14),
@@ -1700,10 +1772,11 @@ def build_dashboard(dash_ws, rows, feature_status, new_data, ticket_data=None):
         row += 1
         c = dash_ws.cell(
             row=row, column=1,
-            value=("Progress = share of linked roadmap items (PBIs) that are Done. 'Done' = all linked PBIs "
-                   "completed or the ticket is resolved/closed in the ticket system. Yellow rows on the Tickets "
-                   "sheet are 100% complete in ADO but still open there. Resolved tickets without any roadmap "
-                   "link are excluded."),
+            value=("Azure Status (Tickets sheet) = status of the linked roadmap stories: empty when all are "
+                   "Backlog, 'Development' once at least one story started, 'Testing' when all are Testing/Done, "
+                   "'Done' when all are Done or the ticket is resolved/closed in the ticket system. Yellow rows "
+                   "on the Tickets sheet are complete in ADO but still open there. Resolved tickets without any "
+                   "roadmap link are excluded."),
         )
         c.font = Font(name="Segoe UI", size=9, italic=True, color="808080")
         dash_ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
@@ -1754,8 +1827,8 @@ def build_new_stories_sheet(wb, detail_rows):
     ws.sheet_properties.tabColor = "70AD47"
 
     headers = ["Owner", "Project", "Module", "Feature", "Story Title", "Story ID",
-               "Ticket Number", "Ticket Priority", "Status", "Added on"]
-    widths = [30, 20, 20, 42, 55, 12, 14, 14, 13, 13]
+               "Ticket Number", "Ticket Priority", "Region", "Status", "Added on"]
+    widths = [30, 20, 20, 42, 55, 12, 14, 14, 16, 13, 13]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -1772,7 +1845,7 @@ def build_new_stories_sheet(wb, detail_rows):
 
     c = ws.cell(row=1, column=1, value=f"New Stories & Features — Created After {CUTOFF_DATE}")
     c.font = title_font
-    ws.merge_cells("A1:J1")
+    ws.merge_cells("A1:K1")
 
     header_row = 3
 
@@ -1792,7 +1865,7 @@ def build_new_stories_sheet(wb, detail_rows):
         for d in detail_rows:
             vals = [d["Owner"], d["Project"], d["Module"], d["Feature"],
                     d["Story Title"], d["Story ID"], d["Ticket Number"],
-                    d["Ticket Priority"], d["Status"], d["Added on"]]
+                    d["Ticket Priority"], d["Region"], d["Status"], d["Added on"]]
             for col_idx, val in enumerate(vals, 1):
                 c = ws.cell(row=r, column=col_idx, value=val)
                 c.font = data_font
@@ -1805,7 +1878,7 @@ def build_new_stories_sheet(wb, detail_rows):
         last_row = r - 1
 
         # Real Excel Table -> filter dropdowns + banded styling
-        table_ref = f"A{header_row}:J{last_row}"
+        table_ref = f"A{header_row}:K{last_row}"
         tab = Table(displayName="NewStoriesTable", ref=table_ref,
                     autoFilter=AutoFilter(ref=table_ref))
         tab.tableColumns = [TableColumn(id=i + 1, name=h) for i, h in enumerate(headers)]
@@ -1833,8 +1906,8 @@ def build_completed_stories_sheet(wb, detail_rows):
     ws.sheet_properties.tabColor = "548235"
 
     headers = ["Owner", "Project", "Module", "Feature", "Story Title", "Story ID",
-               "Standard Weight", "Ticket Number", "Ticket Priority", "Done Date"]
-    widths = [30, 20, 20, 42, 55, 12, 14, 14, 14, 13]
+               "Standard Weight", "Ticket Number", "Ticket Priority", "Region", "Done Date"]
+    widths = [30, 20, 20, 42, 55, 12, 14, 14, 14, 16, 13]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -1853,12 +1926,12 @@ def build_completed_stories_sheet(wb, detail_rows):
     c = ws.cell(row=1, column=1,
                 value="List of user stories delivered to the PO since the cut off")
     c.font = title_font
-    ws.merge_cells("A1:J1")
+    ws.merge_cells("A1:K1")
 
     c = ws.cell(row=2, column=1,
                 value=f"Stories set as Done after {CUTOFF_DATE}  |  {len(detail_rows)} user stories")
     c.font = meta_font
-    ws.merge_cells("A2:J2")
+    ws.merge_cells("A2:K2")
 
     header_row = 4
 
@@ -1879,7 +1952,7 @@ def build_completed_stories_sheet(wb, detail_rows):
         for d in detail_rows:
             vals = [d["Owner"], d["Project"], d["Module"], d["Feature"],
                     d["Story Title"], d["Story ID"], d["Standard Weight"],
-                    d["Ticket Number"], d["Ticket Priority"], d["Done Date"]]
+                    d["Ticket Number"], d["Ticket Priority"], d["Region"], d["Done Date"]]
             for col_idx, val in enumerate(vals, 1):
                 c = ws.cell(row=r, column=col_idx, value=val)
                 c.font = data_font
@@ -1892,7 +1965,7 @@ def build_completed_stories_sheet(wb, detail_rows):
         last_row = r - 1
 
         # Real Excel Table -> filter dropdowns + banded styling
-        table_ref = f"A{header_row}:J{last_row}"
+        table_ref = f"A{header_row}:K{last_row}"
         tab = Table(displayName="CompletedStoriesTable", ref=table_ref,
                     autoFilter=AutoFilter(ref=table_ref))
         tab.tableColumns = [TableColumn(id=i + 1, name=h) for i, h in enumerate(headers)]
@@ -1913,19 +1986,20 @@ def build_completed_stories_sheet(wb, detail_rows):
 
 def build_tickets_sheet(wb, ticket_data):
     """Dedicated 'Tickets' sheet: every tracked ticket from the ticket
-    system export with name, module, severity, number, Progress, status
-    and a 'Covered by Roadmap' flag — as a real Excel Table (filter
-    dropdowns + banded rows). Progress = share of linked roadmap stories
-    that are Done ('Done' at 100%, empty at 0% / not covered); rows that
-    are 100% complete in ADO but still open in the ticket system are
-    highlighted faint yellow. Sorted by severity, then not-covered
-    first, then ticket number. Skipped gracefully when the export is
-    unavailable."""
+    system export with name, module, region (Business Unit), severity,
+    number, Azure Status, status and a 'Covered by Roadmap' flag — as a
+    real Excel Table (filter dropdowns + banded rows). Azure Status
+    follows the flow empty > Development > Testing > Done based on the
+    linked roadmap stories ('Done' also when the ticket is resolved or
+    closed); rows that are 'Done' in ADO but still open in the ticket
+    system are highlighted faint yellow. Sorted by severity, then
+    not-covered first, then ticket number. Skipped gracefully when the
+    export is unavailable."""
     ws = wb.create_sheet("Tickets", 4)
     ws.sheet_properties.tabColor = "C55A11"
 
-    headers = ["Ticket Name", "Module", "Severity", "Ticket Number", "Progress", "Status", "Covered by Roadmap"]
-    widths = [60, 22, 16, 16, 12, 16, 20]
+    headers = ["Ticket Name", "Module", "Region", "Severity", "Ticket Number", "Azure Status", "Status", "Covered by Roadmap"]
+    widths = [60, 22, 20, 16, 16, 14, 16, 20]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -1954,14 +2028,15 @@ def build_tickets_sheet(wb, ticket_data):
         c = ws.cell(row=1, column=1,
                     value=f"Ticket System Analysis — {os.path.basename(ticket_data['export_path'])}")
         c.font = title_font
-        ws.merge_cells("A1:G1")
+        ws.merge_cells("A1:H1")
 
         c = ws.cell(row=2, column=1,
-                    value=("Progress = share of linked roadmap items (PBIs) that are Done. 'Done' = all linked "
-                           "PBIs completed or the ticket is resolved/closed. Yellow rows are 100% complete in "
-                           "ADO but still open in the ticket system."))
+                    value=("Azure Status = status of the linked roadmap stories: empty when all are Backlog, "
+                           "'Development' once at least one story started, 'Testing' when all are Testing/Done, "
+                           "'Done' when all are Done or the ticket is resolved/closed. Yellow rows are complete "
+                           "in ADO but still open in the ticket system."))
         c.font = note_font
-        ws.merge_cells("A2:G2")
+        ws.merge_cells("A2:H2")
 
         excluded = ticket_data.get("excluded_total", 0)
         filter_note = (f"Tracking Request Type '{'/'.join(TICKET_REQUEST_TYPES)}' — excluding Rejected / On hold "
@@ -1970,19 +2045,19 @@ def build_tickets_sheet(wb, ticket_data):
             filter_note += f" — {excluded} tickets excluded"
         c = ws.cell(row=3, column=1, value=filter_note)
         c.font = meta_font
-        ws.merge_cells("A3:G3")
+        ws.merge_cells("A3:H3")
 
         header_row = 4
     else:
         c = ws.cell(row=1, column=1, value="Ticket System Analysis")
         c.font = title_font
-        ws.merge_cells("A1:G1")
+        ws.merge_cells("A1:H1")
 
         c = ws.cell(row=2, column=1,
                     value=(f"No ticket export found (pattern '{TICKET_EXPORT_PATTERN}' in "
                            f"'{TICKET_EXPORT_FOLDER}') — ticket analysis skipped."))
         c.font = meta_font
-        ws.merge_cells("A2:G2")
+        ws.merge_cells("A2:H2")
 
         header_row = 4
 
@@ -2008,21 +2083,14 @@ def build_tickets_sheet(wb, ticket_data):
             ),
         )
 
-        def progress_text(progress):
-            if progress is None or progress <= 0:
-                return ""  # not covered or 0% -> empty
-            if progress >= 1:
-                return "Done"
-            return f"{round(progress * 100)}%"
-
         r = header_row + 1
         for t in tickets:
             covered = t.get("covered")
-            progress = t.get("progress")
-            row_highlight = (progress is not None and progress >= 1 and not t.get("resolved"))
-            vals = [t.get("name", ""), t.get("module", ""), t.get("severity", ""),
-                    t.get("number", ""), progress_text(progress), t.get("status", ""),
-                    "Yes" if covered else "No"]
+            azure_status = t.get("azure_status", "")
+            row_highlight = (azure_status == "Done" and not t.get("resolved"))
+            vals = [t.get("name", ""), t.get("module", ""), t.get("region", "") or "Unknown",
+                    t.get("severity", ""), t.get("number", ""), azure_status,
+                    t.get("status", ""), "Yes" if covered else "No"]
             for col_idx, val in enumerate(vals, 1):
                 c = ws.cell(row=r, column=col_idx, value=val)
                 c.border = thin_b
@@ -2030,22 +2098,22 @@ def build_tickets_sheet(wb, ticket_data):
                 c.alignment = data_align
                 if row_highlight:
                     c.fill = highlight_fill
-                if col_idx == 5 and progress is not None and progress >= 1:
+                if col_idx == 6 and azure_status == "Done":
                     c.fill = done_fill
                     c.font = done_font
                     c.alignment = Alignment(horizontal="center", vertical="center")
-                elif col_idx == 7:
+                elif col_idx == 8:
                     c.font = covered_font if covered else not_covered_font
                     c.fill = covered_fill if covered else not_covered_fill
                     c.alignment = Alignment(horizontal="center", vertical="center")
-                if col_idx == 4 and t.get("guid"):
+                if col_idx == 5 and t.get("guid"):
                     c.hyperlink = TICKET_URL_TEMPLATE.format(guid=t["guid"])
                     c.font = link_font
             r += 1
         last_row = r - 1
 
         # Real Excel Table -> filter dropdowns + banded styling
-        table_ref = f"A{header_row}:G{last_row}"
+        table_ref = f"A{header_row}:H{last_row}"
         tab = Table(displayName="TicketsTable", ref=table_ref,
                     autoFilter=AutoFilter(ref=table_ref))
         tab.tableColumns = [TableColumn(id=i + 1, name=h) for i, h in enumerate(headers)]
@@ -2118,7 +2186,7 @@ def main():
             pass
 
     print("=" * 60)
-    print("  ADO Roadmap Sync v7.1")
+    print("  ADO Roadmap Sync v7.3")
     print("  TFS: " + TFS_URL)
     print(f"  Projects: {', '.join(PROJECTS)}")
     print("=" * 60)
