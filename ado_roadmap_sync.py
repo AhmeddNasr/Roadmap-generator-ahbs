@@ -1,5 +1,5 @@
 # ============================================================
-# ADO Roadmap Sync Script v7.3
+# ADO Roadmap Sync Script v7.5
 # Pulls Product Backlog Items + orphan Features/Epics
 # from HMIS (TFS on-prem) and generates a roadmap Excel
 # matching the original format, with a Dashboard sheet.
@@ -31,6 +31,16 @@
 # Testing or Done, 'Done' when all stories are Done (or the ticket is
 # resolved/closed). The Azure ID column is also populated for orphan
 # Feature/Epic rows (the feature's/epic's own ID) instead of empty.
+#
+# New in v7.4: display-only change on the Roadmap sheet — Backlog rows
+# show their TFS state there: 'Backlog/New' for state New,
+# 'Backlog/Approved' for state Approved. Everywhere else (dashboard
+# counts, other sheets, sorting, feature group status) the value
+# remains 'Backlog'.
+#
+# New in v7.5: Ticket Number cells are highlighted faint red when the
+# row references a ticket number that is not in the ticket export
+# (Roadmap, New Stories and Completed Stories sheets).
 #
 # New in v6: no carry-over — the roadmap is built completely
 # fresh from TFS on every run.
@@ -100,6 +110,7 @@ ALLOWED_OWNERS = [
     "mohamed adel khalifa",
     "mohamed moataz",
     "elzohery",
+    "eslam ibrahim mahmoud ismail",
 ]
 
 # New TFS fields (roadmap columns). Values live on Features and stories;
@@ -434,6 +445,22 @@ def map_status(state, working_status):
     return "Backlog"
 
 
+def roadmap_display_status(row):
+    """Display-only status for the Roadmap sheet: Backlog rows are split
+    by their raw TFS state — 'Backlog/New' for state New,
+    'Backlog/Approved' for state Approved. Everything else (dashboard
+    counts, other sheets, sorting, feature group status) keeps the plain
+    'Backlog' value."""
+    if row.get("Status") != "Backlog":
+        return row.get("Status", "")
+    state = str(row.get("_state") or "").lower().strip()
+    if state == "new":
+        return "Backlog/New"
+    if state == "approved":
+        return "Backlog/Approved"
+    return "Backlog"
+
+
 def build_business_area_with_grandparent(parent_id, parent_lookup, grandparent_lookup):
     if not parent_id or parent_id not in parent_lookup:
         return ""
@@ -677,6 +704,7 @@ def map_pbi_to_row(wi, parent_lookup, grandparent_lookup):
         "_parent_id": parent_id_str,
         "_project": fields.get("System.TeamProject", ""),
         "_own_group": own_group,
+        "_state": state,
     }
 
 
@@ -733,6 +761,7 @@ def map_orphan_to_row(wi, parent_lookup, grandparent_lookup):
         "_parent_id": "",
         "_project": fields.get("System.TeamProject", ""),
         "_own_group": False,
+        "_state": fields.get("System.State", ""),
     }
 
 
@@ -1110,6 +1139,7 @@ def build_ticket_analysis(rows):
         "cat_counts": cat_counts,
         "missing_from_export": missing_from_export,
         "roadmap_ticket_count": len(covered_set),
+        "export_ids": export_ids,
         "number_to_priority": number_to_priority,
         "number_to_guid": number_to_guid,
         "number_to_region": number_to_region,
@@ -1255,6 +1285,30 @@ def generate_excel(rows):
             d.get("Ticket Number", ""), ticket_region_lookup
         )
 
+    # Faint-red flag for Ticket Number cells: the row references a ticket
+    # number that is NOT in the ticket export. Only when the export was
+    # actually loaded (no export -> nothing to compare against)
+    if ticket_data:
+        ticket_export_ids = ticket_data.get("export_ids") or set()
+
+        def has_missing_ticket(ticket_number_value):
+            nums = parse_ticket_numbers(ticket_number_value)
+            return bool(nums) and any(n not in ticket_export_ids for n in nums)
+
+        for r in rows:
+            r["_ticket_missing"] = has_missing_ticket(r.get("Ticket Number", ""))
+        for d in new_detail_rows:
+            d["_ticket_missing"] = has_missing_ticket(d.get("Ticket Number", ""))
+        for d in completed_detail_rows:
+            d["_ticket_missing"] = has_missing_ticket(d.get("Ticket Number", ""))
+    else:
+        for r in rows:
+            r["_ticket_missing"] = False
+        for d in new_detail_rows:
+            d["_ticket_missing"] = False
+        for d in completed_detail_rows:
+            d["_ticket_missing"] = False
+
     # Ticket deep links into Dynamics — first ticket listed in the cell
     number_to_guid = (ticket_data or {}).get("number_to_guid", {})
 
@@ -1315,6 +1369,7 @@ def generate_excel(rows):
     weight_align = Alignment(vertical="top", horizontal="left")
     feature_font = Font(name="Segoe UI", size=10, bold=True)
     feature_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+    missing_ticket_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 
     # Feature group fully done = Done status green (feature column only)
 
@@ -1352,7 +1407,8 @@ def generate_excel(rows):
         is_done_group = (group_status == "Done")
 
         for col_idx, (col_name, _) in enumerate(columns, 1):
-            value = row_data.get(col_name, "")
+            value = (roadmap_display_status(row_data) if col_name == "Status"
+                     else row_data.get(col_name, ""))
             cell = ws.cell(row=row_idx, column=col_idx, value=value)
             cell.font = data_font
             cell.alignment = weight_align if col_idx == weight_col_idx else data_align
@@ -1370,6 +1426,11 @@ def generate_excel(rows):
             if col_name == "Ticket Number" and row_data.get("Ticket URL"):
                 cell.hyperlink = row_data["Ticket URL"]
                 cell.font = link_font
+
+            # Faint red when a referenced ticket number is missing from
+            # the ticket system export
+            if col_name == "Ticket Number" and row_data.get("_ticket_missing"):
+                cell.fill = missing_ticket_fill
 
             # Determine fill
             if col_idx == feature_col_idx:
@@ -1860,6 +1921,7 @@ def build_new_stories_sheet(wb, detail_rows):
         data_font = Font(name="Segoe UI", size=10)
         link_font = Font(name="Segoe UI", size=10, color="0563C1", underline="single")
         data_align = Alignment(vertical="top", wrap_text=True)
+        missing_ticket_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 
         r = header_row + 1
         for d in detail_rows:
@@ -1874,6 +1936,8 @@ def build_new_stories_sheet(wb, detail_rows):
                 if col_idx == 7 and d.get("Ticket URL"):
                     c.hyperlink = d["Ticket URL"]
                     c.font = link_font
+                if col_idx == 7 and d.get("_ticket_missing"):
+                    c.fill = missing_ticket_fill
             r += 1
         last_row = r - 1
 
@@ -1947,6 +2011,7 @@ def build_completed_stories_sheet(wb, detail_rows):
         link_font = Font(name="Segoe UI", size=10, color="0563C1", underline="single")
         weight_align = Alignment(vertical="top", horizontal="left")
         data_align = Alignment(vertical="top", wrap_text=True)
+        missing_ticket_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 
         r = header_row + 1
         for d in detail_rows:
@@ -1961,6 +2026,8 @@ def build_completed_stories_sheet(wb, detail_rows):
                 if col_idx == 8 and d.get("Ticket URL"):
                     c.hyperlink = d["Ticket URL"]
                     c.font = link_font
+                if col_idx == 8 and d.get("_ticket_missing"):
+                    c.fill = missing_ticket_fill
             r += 1
         last_row = r - 1
 
@@ -2186,7 +2253,7 @@ def main():
             pass
 
     print("=" * 60)
-    print("  ADO Roadmap Sync v7.3")
+    print("  ADO Roadmap Sync v7.5")
     print("  TFS: " + TFS_URL)
     print(f"  Projects: {', '.join(PROJECTS)}")
     print("=" * 60)
