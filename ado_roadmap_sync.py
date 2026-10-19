@@ -1,5 +1,5 @@
 # ============================================================
-# ADO Roadmap Sync Script v7.5
+# ADO Roadmap Sync Script v7.6
 # Pulls Product Backlog Items + orphan Features/Epics
 # from HMIS (TFS on-prem) and generates a roadmap Excel
 # matching the original format, with a Dashboard sheet.
@@ -41,6 +41,9 @@
 # New in v7.5: Ticket Number cells are highlighted faint red when the
 # row references a ticket number that is not in the ticket export
 # (Roadmap, New Stories and Completed Stories sheets).
+#
+# New in v7.6: the Roadmap sheet includes the PBI Development Due Date
+# (Custom.DevelopmentDueDate), displayed as the local calendar date only.
 #
 # New in v6: no carry-over — the roadmap is built completely
 # fresh from TFS on every run.
@@ -129,6 +132,7 @@ HTML_NEW_FIELDS = {"Custom.Ticketnumber", "Custom.BusinessImpactValue"}
 # Falls back to the item's Effort when Standard Weight is empty.
 STANDARD_WEIGHT_REF = "Custom.Standaredweight"
 EFFORT_REF = "Microsoft.VSTS.Scheduling.Effort"
+DEVELOPMENT_DUE_DATE_REF = "Custom.DevelopmentDueDate"
 
 # Cutoff date for dashboard "new items" counting
 CUTOFF_DATE = "2026-09-01"
@@ -379,6 +383,27 @@ def format_date(date_string):
         return dt.strftime("%Y-%m-%d")
     except:
         return date_string
+
+
+def format_local_date_only(date_string):
+    """Format an Azure date field as the local calendar date, omitting time.
+
+    Date fields are returned by Azure as UTC timestamps. Convert aware values
+    to the machine's local timezone first so the result matches the date shown
+    in the Azure UI (for example, 2026-10-19T21:00:00Z becomes 2026-10-20
+    in UTC+03:00).
+    """
+    if not date_string:
+        return ""
+    raw = str(date_string).strip()
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone()
+        return dt.strftime("%Y-%m-%d")
+    except (TypeError, ValueError):
+        # Keep only the date if Azure returns an unexpected string format.
+        return raw.split("T", 1)[0].split(" ", 1)[0]
 
 
 def to_number(value):
@@ -667,6 +692,11 @@ def map_pbi_to_row(wi, parent_lookup, grandparent_lookup):
     if activated:
         start_date = format_date(activated)
 
+    # Development due date (PBI-only Azure field; keep the local calendar date)
+    development_due_date = format_local_date_only(
+        fields.get(DEVELOPMENT_DUE_DATE_REF, "")
+    )
+
     # Delivery date
     delivery_date = ""
     closed = fields.get("Microsoft.VSTS.Common.ClosedDate", "")
@@ -695,6 +725,7 @@ def map_pbi_to_row(wi, parent_lookup, grandparent_lookup):
         "Status": status,
         "Added on": added_on,
         "Start Date": start_date,
+        "Development Due Date": development_due_date,
         "Done Date": delivery_date,
         "Category": new_vals.get("Category", ""),
         "Notes": new_vals.get("Notes", ""),
@@ -752,6 +783,7 @@ def map_orphan_to_row(wi, parent_lookup, grandparent_lookup):
         "Status": "Backlog",
         "Added on": format_date(created_date),
         "Start Date": "",
+        "Development Due Date": "",
         "Done Date": "",
         "Category": new_vals.get("Category", ""),
         "Notes": new_vals.get("Notes", ""),
@@ -1348,6 +1380,7 @@ def generate_excel(rows):
         ("Status", 14),
         ("Added on", 14),
         ("Start Date", 14),
+        ("Development Due Date", 18),
         ("Done Date", 14),
         ("Category", 18),
         ("Notes", 35),
@@ -2253,7 +2286,7 @@ def main():
             pass
 
     print("=" * 60)
-    print("  ADO Roadmap Sync v7.5")
+    print("  ADO Roadmap Sync v7.6")
     print("  TFS: " + TFS_URL)
     print(f"  Projects: {', '.join(PROJECTS)}")
     print("=" * 60)
