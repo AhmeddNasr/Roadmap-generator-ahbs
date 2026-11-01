@@ -1,5 +1,5 @@
 # ============================================================
-# ADO Roadmap Sync Script v7.6
+# ADO Roadmap Sync Script v7.7
 # Pulls Product Backlog Items + orphan Features/Epics
 # from HMIS (TFS on-prem) and generates a roadmap Excel
 # matching the original format, with a Dashboard sheet.
@@ -44,6 +44,14 @@
 #
 # New in v7.6: the Roadmap sheet includes the PBI Development Due Date
 # (Custom.DevelopmentDueDate), displayed as the local calendar date only.
+#
+# New in v7.7: when a PBI has no Development Due Date, the parent
+# Feature's Target Date is used instead; empty when neither is set.
+# The Roadmap columns 'Category' and 'Notes' are renamed to 'Business
+# Value Category' and 'Business Impact Value'. A 'Priority' column
+# (Microsoft.VSTS.Common.Priority) sits next to Impact on the Roadmap.
+# A 'Scrum' column sits next to Module — rules live in the SCRUM
+# ASSIGNMENT config block (project > title keyword > module).
 #
 # New in v6: no carry-over — the roadmap is built completely
 # fresh from TFS on every run.
@@ -121,8 +129,8 @@ ALLOWED_OWNERS = [
 # its own value for that field (story level overrides feature level).
 NEW_FIELD_REFS = {
     "Ticket Number": "Custom.Ticketnumber",
-    "Notes": "Custom.BusinessImpactValue",
-    "Category": "Custom.BusinessValueCategory",
+    "Business Impact Value": "Custom.BusinessImpactValue",
+    "Business Value Category": "Custom.BusinessValueCategory",
     "Impact": "Custom.Impactlevel",
 }
 # Some of these fields are HTML-formatted in TFS and need cleaning
@@ -133,6 +141,9 @@ HTML_NEW_FIELDS = {"Custom.Ticketnumber", "Custom.BusinessImpactValue"}
 STANDARD_WEIGHT_REF = "Custom.Standaredweight"
 EFFORT_REF = "Microsoft.VSTS.Scheduling.Effort"
 DEVELOPMENT_DUE_DATE_REF = "Custom.DevelopmentDueDate"
+PRIORITY_REF = "Microsoft.VSTS.Common.Priority"
+# Feature Target Date — fallback for a story's Development Due Date
+TARGET_DATE_REF = "Microsoft.VSTS.Scheduling.TargetDate"
 
 # Cutoff date for dashboard "new items" counting
 CUTOFF_DATE = "2026-09-01"
@@ -206,6 +217,50 @@ STATUS_ORDER = {
     "Development": 2,
     "Backlog": 3,
 }
+
+# ------------------------------------------------------------
+# SCRUM ASSIGNMENT (Roadmap 'Scrum' column) — edit freely.
+# Rules are checked in this order; the first match wins:
+#   1. SCRUM_BY_PROJECT  — every item in that TFS project
+#   2. SCRUM_KEYWORDS    — whole word in the feature or story title
+#   3. SCRUM_MODULES     — the story's Module field
+# Matching ignores case, spaces and punctuation ('Lab and Rad' =
+# 'lab & rad'). List TFS misspellings too (e.g. 'VisitManagment').
+# Anything that matches no rule shows SCRUM_UNASSIGNED.
+# ------------------------------------------------------------
+SCRUM_BY_PROJECT = {
+    "Websites": "Scrum 11",
+    "HR System": "Scrum 14",
+    "Mobile Applications": "Scrum 8",
+}
+
+SCRUM_KEYWORDS = {
+    "Scrum 5": ["SMS", "QMS"],
+}
+
+SCRUM_MODULES = {
+    "Scrum 1": [
+        "CPOE", "Lab and Rad", "Nurse Portal", "Physician Desktop",
+        "Patient Problems", "Clinical Notes", "Patient Summary",
+        "Allergies", "Clinical Sheets",
+    ],
+    "Scrum 2": [
+        "Visit Management", "VisitManagment", "Pharmacy",
+        "Appointment Booking", "Physician Schedule", "Bed Management",
+    ],
+    "Scrum 3": [
+        "Blood Bank", "Product Management", "Supply Chain", "ATS",
+    ],
+    "Scrum 4": [
+        "Nphies",
+    ],
+    "Scrum 5": [
+        "MPI", "Medical Setup", "Finance", "BO_finanace", "Billing",
+        "Hospital structure",
+    ],
+}
+
+SCRUM_UNASSIGNED = "Unassigned"
 
 
 # ============================================================
@@ -316,6 +371,7 @@ def fetch_work_items_basic(ids):
                     "type": flds.get("System.WorkItemType", ""),
                     "assigned_to": extract_display_name(flds.get("System.AssignedTo")),
                     "new_values": extract_new_values(flds),
+                    "target_date": flds.get(TARGET_DATE_REF, ""),
                 }
     return lookup
 
@@ -484,6 +540,32 @@ def roadmap_display_status(row):
     if state == "approved":
         return "Backlog/Approved"
     return "Backlog"
+
+
+def _scrum_key(text):
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
+_SCRUM_BY_MODULE = {
+    _scrum_key(module): scrum
+    for scrum, modules in SCRUM_MODULES.items()
+    for module in modules
+}
+
+
+def resolve_scrum(row):
+    """Scrum for a roadmap row — see SCRUM ASSIGNMENT in the config:
+    project first, then SMS/QMS-style keywords in the feature or story
+    title, then the story's module; SCRUM_UNASSIGNED when none match."""
+    scrum = SCRUM_BY_PROJECT.get(row.get("_project", ""))
+    if scrum:
+        return scrum
+    titles = f"{row.get('Business Area / Feature', '')} {row.get('Requirement', '')}"
+    for scrum, keywords in SCRUM_KEYWORDS.items():
+        for kw in keywords:
+            if re.search(rf"\b{re.escape(kw)}\b", titles, re.IGNORECASE):
+                return scrum
+    return _SCRUM_BY_MODULE.get(_scrum_key(row.get("Module", "")), SCRUM_UNASSIGNED)
 
 
 def build_business_area_with_grandparent(parent_id, parent_lookup, grandparent_lookup):
@@ -692,10 +774,14 @@ def map_pbi_to_row(wi, parent_lookup, grandparent_lookup):
     if activated:
         start_date = format_date(activated)
 
-    # Development due date (PBI-only Azure field; keep the local calendar date)
-    development_due_date = format_local_date_only(
-        fields.get(DEVELOPMENT_DUE_DATE_REF, "")
-    )
+    # Development due date: the PBI's own due date, else the parent
+    # Feature's Target Date, else empty (keep the local calendar date)
+    due_date_raw = fields.get(DEVELOPMENT_DUE_DATE_REF, "")
+    if not due_date_raw and parent_id in parent_lookup:
+        parent_info = parent_lookup[parent_id]
+        if parent_info.get("type") == "Feature":
+            due_date_raw = parent_info.get("target_date", "")
+    development_due_date = format_local_date_only(due_date_raw)
 
     # Delivery date
     delivery_date = ""
@@ -722,13 +808,14 @@ def map_pbi_to_row(wi, parent_lookup, grandparent_lookup):
         "Standard Weight": resolve_standard_weight(fields),
         "Ticket Number": new_vals.get("Ticket Number", ""),
         "Impact": new_vals.get("Impact", ""),
+        "Priority": fields.get(PRIORITY_REF, ""),
         "Status": status,
         "Added on": added_on,
         "Start Date": start_date,
         "Development Due Date": development_due_date,
         "Done Date": delivery_date,
-        "Category": new_vals.get("Category", ""),
-        "Notes": new_vals.get("Notes", ""),
+        "Business Value Category": new_vals.get("Business Value Category", ""),
+        "Business Impact Value": new_vals.get("Business Impact Value", ""),
         "_id": sync_id,
         "_item_type": "story",
         "_created_date": created_date,
@@ -780,13 +867,14 @@ def map_orphan_to_row(wi, parent_lookup, grandparent_lookup):
         "Standard Weight": resolve_standard_weight(fields),
         "Ticket Number": new_vals.get("Ticket Number", ""),
         "Impact": new_vals.get("Impact", ""),
+        "Priority": fields.get(PRIORITY_REF, ""),
         "Status": "Backlog",
         "Added on": format_date(created_date),
         "Start Date": "",
         "Development Due Date": "",
         "Done Date": "",
-        "Category": new_vals.get("Category", ""),
-        "Notes": new_vals.get("Notes", ""),
+        "Business Value Category": new_vals.get("Business Value Category", ""),
+        "Business Impact Value": new_vals.get("Business Impact Value", ""),
         "_id": str(wi.get("id", "")),
         "_item_type": "feature",
         "_created_date": created_date,
@@ -1317,6 +1405,10 @@ def generate_excel(rows):
             d.get("Ticket Number", ""), ticket_region_lookup
         )
 
+    # Scrum per row (Roadmap sheet) — rules in SCRUM ASSIGNMENT config
+    for r in rows:
+        r["Scrum"] = resolve_scrum(r)
+
     # Faint-red flag for Ticket Number cells: the row references a ticket
     # number that is NOT in the ticket export. Only when the export was
     # actually loaded (no export -> nothing to compare against)
@@ -1369,6 +1461,7 @@ def generate_excel(rows):
     columns = [
         ("Owner", 28),
         ("Module", 18),
+        ("Scrum", 12),
         ("Business Area / Feature", 40),
         ("Requirement", 50),
         ("Azure ID", 12),
@@ -1377,13 +1470,14 @@ def generate_excel(rows):
         ("Ticket Priority", 14),
         ("Region", 16),
         ("Impact", 12),
+        ("Priority", 10),
         ("Status", 14),
         ("Added on", 14),
         ("Start Date", 14),
         ("Development Due Date", 18),
         ("Done Date", 14),
-        ("Category", 18),
-        ("Notes", 35),
+        ("Business Value Category", 18),
+        ("Business Impact Value", 35),
     ]
 
     header_font = Font(name="Segoe UI", bold=True, color="FFFFFF", size=11)
