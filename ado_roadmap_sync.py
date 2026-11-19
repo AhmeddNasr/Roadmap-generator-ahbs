@@ -119,7 +119,7 @@ ALLOWED_OWNERS = [
     "ibrahim abdelfattah mohamed ghanem",
     "nada adel khamis",
     "mohamed adel khalifa",
-    "mohamed moataz",
+    "mohamed ahmed elbadawy",
     "elzohery",
     "eslam ibrahim mahmoud ismail",
 ]
