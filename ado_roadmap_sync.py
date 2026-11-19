@@ -173,7 +173,7 @@ SEVERITY_ORDER = ["Critical", "High", "Medium", "Normal"]
 TICKET_EXPORT_COLUMNS = {
     "number": ["ID"],
     "name": ["Subject", "Title"],
-    "severity": ["Priority", "Severity"],
+    "severity": ["Impact Level", "Priority", "Severity"],
     "status": ["Status"],
     "request_type": ["Request Type", "Type"],
     "module": ["Subcategory", "Module"],
