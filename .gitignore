@@ -1,0 +1,7 @@
+# Ticket system exports & generated roadmaps
+*.xlsx
+~$*.xlsx
+
+# Python
+__pycache__/
+*.py[cod]
